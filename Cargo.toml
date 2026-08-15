@@ -1,0 +1,37 @@
+[package]
+name = "kite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A fast video editor"
+default-run = "kite"
+build = "build.rs"
+
+[[bin]]
+name = "kite"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.33"
+rfd = "0.15"
+cpal = "0.16"
+zune-jpeg = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+anyhow = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+dirs = "6"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

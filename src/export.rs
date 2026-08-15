@@ -1,0 +1,520 @@
+//! Export: turns the timeline into a single ffmpeg filtergraph over the **original** media.
+//!
+//! Playback uses proxies, but delivery never does — the graph below reads the source files at full
+//! resolution, so what you export is the real quality regardless of what you edited against.
+
+use crate::ffmpeg::{self, Tools};
+use crate::project::{ClipSource, MediaId, Project, TextAlign, TrackKind};
+use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoder {
+    X264,
+    NvencH264,
+    QsvH264,
+    AmfH264,
+}
+
+impl Encoder {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Encoder::X264 => "x264 (software, works everywhere)",
+            Encoder::NvencH264 => "NVIDIA NVENC (fast)",
+            Encoder::QsvH264 => "Intel Quick Sync (fast)",
+            Encoder::AmfH264 => "AMD AMF (fast)",
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Encoder::X264 => "libx264",
+            Encoder::NvencH264 => "h264_nvenc",
+            Encoder::QsvH264 => "h264_qsv",
+            Encoder::AmfH264 => "h264_amf",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quality {
+    High,
+    Balanced,
+    Small,
+}
+
+impl Quality {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Quality::High => "High — best for YouTube",
+            Quality::Balanced => "Balanced",
+            Quality::Small => "Small file",
+        }
+    }
+    fn crf(&self) -> u32 {
+        match self {
+            Quality::High => 18,
+            Quality::Balanced => 21,
+            Quality::Small => 25,
+        }
+    }
+    fn audio_kbps(&self) -> u32 {
+        match self {
+            Quality::High => 320,
+            Quality::Balanced => 192,
+            Quality::Small => 128,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ExportSettings {
+    pub path: PathBuf,
+    pub encoder: Encoder,
+    pub quality: Quality,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+#[derive(Debug)]
+pub enum ExportMsg {
+    Progress { pct: f32, frames: i64, speed: String },
+    Done(PathBuf),
+    Failed(String),
+}
+
+pub struct ExportJob {
+    pub rx: crossbeam_channel::Receiver<ExportMsg>,
+    cancel: Arc<AtomicBool>,
+    pub settings: ExportSettings,
+}
+
+impl ExportJob {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Asks ffmpeg which encoders this build actually has, so we only offer ones that will work.
+pub fn available_encoders(tools: &Tools) -> Vec<Encoder> {
+    let mut out = vec![Encoder::X264];
+    let Ok(res) = ffmpeg::command(&tools.ffmpeg)
+        .args(["-v", "quiet", "-encoders"])
+        .stdout(Stdio::piped())
+        .output()
+    else {
+        return out;
+    };
+    let text = String::from_utf8_lossy(&res.stdout);
+    for (enc, needle) in [
+        (Encoder::NvencH264, "h264_nvenc"),
+        (Encoder::QsvH264, "h264_qsv"),
+        (Encoder::AmfH264, "h264_amf"),
+    ] {
+        if text.contains(needle) {
+            out.push(enc);
+        }
+    }
+    out
+}
+
+fn f(t: f64) -> String {
+    format!("{t:.6}")
+}
+
+fn even(v: i64) -> i64 {
+    if v < 2 {
+        2
+    } else {
+        v - (v % 2)
+    }
+}
+
+struct Graph {
+    parts: Vec<String>,
+    n: usize,
+}
+
+impl Graph {
+    fn new() -> Self {
+        Self { parts: Vec::new(), n: 0 }
+    }
+    fn label(&mut self, prefix: &str) -> String {
+        self.n += 1;
+        format!("{prefix}{}", self.n)
+    }
+    fn push(&mut self, s: String) {
+        self.parts.push(s);
+    }
+    fn join(&self) -> String {
+        self.parts.join(";")
+    }
+}
+
+/// Builds the complete `-filter_complex` string plus the ordered list of input files.
+pub fn build_graph(
+    project: &Project,
+    settings: &ExportSettings,
+    font: Option<&Path>,
+) -> Result<(Vec<PathBuf>, String, bool)> {
+    let w = settings.width as i64;
+    let h = settings.height as i64;
+    let fps = settings.fps.max(1);
+    let total_frames = project.duration();
+    if total_frames <= 0 {
+        bail!("the timeline is empty — add a clip before exporting");
+    }
+    let dur = total_frames as f64 / fps as f64;
+
+    // One ffmpeg input per distinct source file, reused by every clip that references it.
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut index_of: BTreeMap<MediaId, usize> = BTreeMap::new();
+    for track in &project.tracks {
+        for clip in &track.clips {
+            if let Some(mid) = clip.media_id() {
+                if !index_of.contains_key(&mid) {
+                    let Some(m) = project.media(mid) else { continue };
+                    index_of.insert(mid, inputs.len());
+                    inputs.push(m.path.clone());
+                }
+            }
+        }
+    }
+
+    let mut g = Graph::new();
+    g.push(format!(
+        "color=c=black:s={w}x{h}:r={fps}:d={}[bg]",
+        f(dur)
+    ));
+    let mut current = "bg".to_string();
+
+    // Video tracks composite bottom-up, so walk them in reverse (they are stored top-first).
+    let video_tracks: Vec<_> = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video && !t.hidden)
+        .collect();
+
+    for track in video_tracks.iter().rev() {
+        for clip in &track.clips {
+            let t0 = clip.start as f64 / fps as f64;
+            let t1 = clip.end() as f64 / fps as f64;
+            let fade_in = clip.fade_in as f64 / fps as f64;
+            let fade_out = clip.fade_out as f64 / fps as f64;
+
+            match &clip.source {
+                ClipSource::Media(mid) => {
+                    let Some(m) = project.media(*mid) else { continue };
+                    if !m.has_video {
+                        continue;
+                    }
+                    let Some(&idx) = index_of.get(mid) else { continue };
+                    let src_in = clip.src_in as f64 / fps as f64;
+                    let src_out = src_in + (clip.len as f64 / fps as f64);
+
+                    let (cw, ch) = fitted_size(m.src_width, m.src_height, w, h, clip.scale);
+                    let lbl = g.label("v");
+                    let mut chain = format!(
+                        "[{idx}:v]trim=start={}:end={},setpts=PTS-STARTPTS+{}/TB,\
+                         scale={cw}:{ch}:flags=bicubic,fps={fps},format=rgba",
+                        f(src_in),
+                        f(src_out),
+                        f(t0)
+                    );
+                    if clip.opacity < 0.999 {
+                        chain.push_str(&format!(",colorchannelmixer=aa={:.4}", clip.opacity));
+                    }
+                    if fade_in > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=in:st={}:d={}:alpha=1",
+                            f(t0),
+                            f(fade_in)
+                        ));
+                    }
+                    if fade_out > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=out:st={}:d={}:alpha=1",
+                            f(t1 - fade_out),
+                            f(fade_out)
+                        ));
+                    }
+                    chain.push_str(&format!("[{lbl}]"));
+                    g.push(chain);
+
+                    let (x, y) = position(w, h, cw, ch, clip.pos_x, clip.pos_y);
+                    let out = g.label("c");
+                    g.push(format!(
+                        "[{current}][{lbl}]overlay=x={x}:y={y}:eof_action=pass:\
+                         enable='between(t,{},{})'[{out}]",
+                        f(t0),
+                        f(t1)
+                    ));
+                    current = out;
+                }
+                ClipSource::Color(rgba) => {
+                    let lbl = g.label("v");
+                    g.push(format!(
+                        "color=c=0x{:02x}{:02x}{:02x}@{:.3}:s={w}x{h}:r={fps}:d={},format=rgba,\
+                         setpts=PTS-STARTPTS+{}/TB[{lbl}]",
+                        rgba[0],
+                        rgba[1],
+                        rgba[2],
+                        rgba[3] as f32 / 255.0,
+                        f(t1 - t0),
+                        f(t0)
+                    ));
+                    let out = g.label("c");
+                    g.push(format!(
+                        "[{current}][{lbl}]overlay=x=0:y=0:eof_action=pass:\
+                         enable='between(t,{},{})'[{out}]",
+                        f(t0),
+                        f(t1)
+                    ));
+                    current = out;
+                }
+                ClipSource::Text(tp) => {
+                    let Some(fontfile) = font else { continue };
+                    let size = (tp.size * h as f32).round().max(8.0) as i64;
+                    let x_expr = match tp.align {
+                        TextAlign::Left => format!("{}", (tp.x * w as f32).round() as i64),
+                        TextAlign::Center => {
+                            format!("{}-text_w/2", (tp.x * w as f32).round() as i64)
+                        }
+                        TextAlign::Right => {
+                            format!("{}-text_w", (tp.x * w as f32).round() as i64)
+                        }
+                    };
+                    let y = (tp.y * h as f32).round() as i64 - size / 2;
+                    let out = g.label("c");
+                    let mut d = format!(
+                        "[{current}]drawtext=fontfile='{}':text='{}':fontsize={size}\
+                         :fontcolor=0x{:02x}{:02x}{:02x}@{:.3}:x={x_expr}:y={y}",
+                        ffmpeg::escape_filter_path(fontfile),
+                        ffmpeg::escape_drawtext(&tp.text),
+                        tp.color[0],
+                        tp.color[1],
+                        tp.color[2],
+                        tp.color[3] as f32 / 255.0,
+                    );
+                    if tp.shadow {
+                        d.push_str(":shadowcolor=black@0.6:shadowx=2:shadowy=2");
+                    }
+                    if tp.box_bg {
+                        d.push_str(":box=1:boxcolor=black@0.5:boxborderw=12");
+                    }
+                    d.push_str(&format!(":enable='between(t,{},{})'[{out}]", f(t0), f(t1)));
+                    g.push(d);
+                    current = out;
+                }
+            }
+        }
+    }
+
+    g.push(format!("[{current}]format=yuv420p[vout]"));
+
+    // --- audio ---
+    let mut alabels: Vec<String> = Vec::new();
+    for track in project.tracks.iter().filter(|t| !t.muted) {
+        for clip in &track.clips {
+            let Some(mid) = clip.media_id() else { continue };
+            let Some(m) = project.media(mid) else { continue };
+            if !m.has_audio {
+                continue;
+            }
+            // A muted video track still contributes its audio unless the track itself is muted.
+            let Some(&idx) = index_of.get(&mid) else { continue };
+            let t0 = clip.start as f64 / fps as f64;
+            let src_in = clip.src_in as f64 / fps as f64;
+            let src_out = src_in + (clip.len as f64 / fps as f64);
+            let delay_ms = (t0 * 1000.0).round() as i64;
+            let lbl = g.label("a");
+            let mut chain = format!(
+                "[{idx}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS,\
+                 aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                f(src_in),
+                f(src_out)
+            );
+            if (clip.volume - 1.0).abs() > 0.001 {
+                chain.push_str(&format!(",volume={:.4}", clip.volume));
+            }
+            if clip.fade_in > 0 {
+                chain.push_str(&format!(
+                    ",afade=t=in:st=0:d={}",
+                    f(clip.fade_in as f64 / fps as f64)
+                ));
+            }
+            if clip.fade_out > 0 {
+                let len = clip.len as f64 / fps as f64;
+                let d = clip.fade_out as f64 / fps as f64;
+                chain.push_str(&format!(",afade=t=out:st={}:d={}", f(len - d), f(d)));
+            }
+            if delay_ms > 0 {
+                chain.push_str(&format!(",adelay={delay_ms}|{delay_ms}"));
+            }
+            chain.push_str(&format!("[{lbl}]"));
+            g.push(chain);
+            alabels.push(lbl);
+        }
+    }
+
+    let has_audio = !alabels.is_empty();
+    if has_audio {
+        let joined: String = alabels.iter().map(|l| format!("[{l}]")).collect();
+        g.push(format!(
+            "{joined}amix=inputs={}:normalize=0:dropout_transition=0,\
+             alimiter=limit=0.97,aresample=48000[aout]",
+            alabels.len()
+        ));
+    }
+
+    Ok((inputs, g.join(), has_audio))
+}
+
+fn fitted_size(sw: u32, sh: u32, w: i64, h: i64, scale: f32) -> (i64, i64) {
+    let sw = sw.max(1) as f64;
+    let sh = sh.max(1) as f64;
+    let fit = (w as f64 / sw).min(h as f64 / sh) * scale.max(0.01) as f64;
+    (even((sw * fit).round() as i64), even((sh * fit).round() as i64))
+}
+
+fn position(w: i64, h: i64, cw: i64, ch: i64, px: f32, py: f32) -> (i64, i64) {
+    let x = (w - cw) / 2 + (px * w as f32).round() as i64;
+    let y = (h - ch) / 2 + (py * h as f32).round() as i64;
+    (x, y)
+}
+
+pub fn start(
+    tools: Arc<Tools>,
+    project: Project,
+    settings: ExportSettings,
+    font: Option<PathBuf>,
+) -> ExportJob {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    let s2 = settings.clone();
+
+    std::thread::Builder::new()
+        .name("kite-export".into())
+        .spawn(move || {
+            let total_frames = project.duration();
+            let res = run_export(&tools, &project, &s2, font.as_deref(), total_frames, &tx, &c2);
+            match res {
+                Ok(()) => {
+                    if c2.load(Ordering::Relaxed) {
+                        let _ = tx.send(ExportMsg::Failed("Export cancelled".into()));
+                    } else {
+                        let _ = tx.send(ExportMsg::Done(s2.path.clone()));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(ExportMsg::Failed(format!("{e:#}")));
+                }
+            }
+        })
+        .expect("spawn export thread");
+
+    ExportJob { rx, cancel, settings }
+}
+
+fn run_export(
+    tools: &Tools,
+    project: &Project,
+    settings: &ExportSettings,
+    font: Option<&Path>,
+    total_frames: i64,
+    tx: &crossbeam_channel::Sender<ExportMsg>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let (inputs, graph, has_audio) = build_graph(project, settings, font)?;
+
+    let mut cmd = ffmpeg::command(&tools.ffmpeg);
+    cmd.args(["-hide_banner", "-v", "error", "-nostdin", "-y"]);
+    for i in &inputs {
+        cmd.arg("-i").arg(i);
+    }
+    cmd.arg("-filter_complex").arg(&graph);
+    cmd.args(["-map", "[vout]"]);
+    if has_audio {
+        cmd.args(["-map", "[aout]"]);
+    }
+
+    let enc = settings.encoder;
+    cmd.args(["-c:v", enc.name()]);
+    match enc {
+        Encoder::X264 => {
+            cmd.args(["-preset", "veryfast", "-crf", &settings.quality.crf().to_string()]);
+        }
+        Encoder::NvencH264 => {
+            cmd.args(["-preset", "p4", "-rc", "vbr", "-cq", &settings.quality.crf().to_string()]);
+        }
+        Encoder::QsvH264 => {
+            cmd.args(["-global_quality", &settings.quality.crf().to_string()]);
+        }
+        Encoder::AmfH264 => {
+            cmd.args(["-quality", "balanced", "-rc", "cqp", "-qp_i", &settings.quality.crf().to_string()]);
+        }
+    }
+    cmd.args(["-pix_fmt", "yuv420p", "-r", &settings.fps.to_string()]);
+    // Interleave keyframes for streaming sites and put the index up front.
+    cmd.args(["-g", &(settings.fps * 2).to_string(), "-movflags", "+faststart"]);
+    if has_audio {
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", settings.quality.audio_kbps())]);
+    }
+    cmd.args(["-progress", "pipe:1", "-nostats"]);
+    cmd.arg(&settings.path);
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting ffmpeg for export")?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let reader = BufReader::new(stdout);
+    let mut frames = 0i64;
+    let mut speed = String::new();
+
+    for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::fs::remove_file(&settings.path).ok();
+            return Ok(());
+        }
+        let Ok(line) = line else { break };
+        if let Some(v) = line.strip_prefix("frame=") {
+            frames = v.trim().parse().unwrap_or(frames);
+        } else if let Some(v) = line.strip_prefix("speed=") {
+            speed = v.trim().to_string();
+        } else if line.starts_with("progress=") {
+            let pct = if total_frames > 0 {
+                (frames as f32 / total_frames as f32 * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let _ = tx.send(ExportMsg::Progress { pct, frames, speed: speed.clone() });
+        }
+    }
+
+    let status = child.wait().context("waiting for ffmpeg")?;
+    if !status.success() {
+        let mut err = String::new();
+        use std::io::Read;
+        if let Some(mut e) = child.stderr.take() {
+            e.read_to_string(&mut err).ok();
+        }
+        let detail = err
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("ffmpeg exited with an error");
+        bail!("{detail}");
+    }
+    Ok(())
+}

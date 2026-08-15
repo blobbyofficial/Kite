@@ -1,0 +1,78 @@
+name: Windows installer
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Fetch ffmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/ffmpeg | Out-Null
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-src
+          $bin = Get-ChildItem -Path ffmpeg-src -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $bin.FullName dist/ffmpeg/ffmpeg.exe
+          $probe = Get-ChildItem -Path ffmpeg-src -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          Copy-Item $probe.FullName dist/ffmpeg/ffprobe.exe
+          Get-Item dist/ffmpeg/*.exe | Select-Object Name,Length
+
+      - name: End-to-end self-test
+        shell: pwsh
+        run: |
+          # Puts the bundled binaries where a real install would have them, then runs the
+          # full import -> decode -> export pipeline against a synthesised clip.
+          New-Item -ItemType Directory -Force -Path target/release/ffmpeg | Out-Null
+          Copy-Item dist/ffmpeg/*.exe target/release/ffmpeg/
+          & target/release/kite.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "self-test failed with code $LASTEXITCODE" }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Write-Host "version $version"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$version" installer\kite.iss
+          Get-ChildItem dist\*.exe
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: KiteSetup-windows
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
