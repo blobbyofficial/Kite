@@ -69,7 +69,9 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup -y --no-progress
           }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
           & $iscc "/DAppVersion=$version" installer\kite.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed with code $LASTEXITCODE" }
           Get-ChildItem dist\*.exe
 
       - name: Upload installer

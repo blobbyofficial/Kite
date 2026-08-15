@@ -21,8 +21,8 @@ UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesInstallIn64BitMode=x64compatible
-ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64
 PrivilegesRequiredOverridesAllowed=dialog
 DisableDirPage=no
 
