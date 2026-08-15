@@ -2,6 +2,8 @@
 
 A video editor built around one idea: **it should stay fast on a modest laptop.**
 
+**[kite website](https://blobbyofficial.github.io/kite/)** · **[Download](../../releases/latest)**
+
 This repository holds two things — a working beta of the editor, and the architecture plan it is
 the first step of.
 
@@ -84,6 +86,9 @@ organising constraint rather than an afterthought.
 | [5. Feature Map](docs/05-feature-map.md) | How each reference app lands, with "good enough to switch" bars |
 | [6. Roadmap](docs/06-roadmap.md) | Five phases, gated on a Phase 0 that can cheaply fail |
 | [7. Risks](docs/07-risks.md) | What kills this, ranked, plus open questions |
+
+One-time GitHub settings that automation cannot apply are listed in
+[docs/REPO-SETUP.md](docs/REPO-SETUP.md).
 
 The beta is a slice of Phase 1. The plan's central bet — compiling a node graph so a long chain
 of effects becomes a single GPU dispatch — is not in it yet; that is Phase 0 work, and the
