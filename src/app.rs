@@ -37,6 +37,9 @@ pub struct DragState {
     /// Frames between the clip start and where the pointer grabbed it.
     pub grab: i64,
     pub moved: bool,
+    /// Every other selected clip, with its start when the drag began, so a multi-clip move keeps
+    /// their spacing exactly.
+    pub others: Vec<(ClipId, i64)>,
 }
 
 pub struct App {
@@ -64,6 +67,8 @@ pub struct App {
     pub scrubbing: bool,
 
     tex: Vec<egui::TextureHandle>,
+    thumbs: HashMap<(MediaId, u32), egui::TextureHandle>,
+    thumb_order: Vec<(MediaId, u32)>,
     pcm: HashMap<MediaId, Arc<Mmap>>,
     peaks: HashMap<MediaId, Arc<Vec<(i16, i16)>>>,
     audio_dirty: bool,
@@ -133,6 +138,8 @@ impl App {
             drag: None,
             scrubbing: false,
             tex: Vec::new(),
+            thumbs: HashMap::new(),
+            thumb_order: Vec::new(),
             pcm: HashMap::new(),
             peaks: HashMap::new(),
             audio_dirty: true,
@@ -560,6 +567,94 @@ impl App {
         self.notify(if ripple { "Rippled out" } else { "Deleted" });
     }
 
+    /// Copies every selected clip and drops the copies immediately after the selection.
+    pub fn duplicate_selected(&mut self) {
+        let sel = self.project.selected_ids();
+        if sel.is_empty() {
+            return;
+        }
+        self.snapshot();
+        let span_end = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.selected)
+            .map(|c| c.end())
+            .max()
+            .unwrap_or(0);
+        let span_start = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.selected)
+            .map(|c| c.start)
+            .min()
+            .unwrap_or(0);
+        let shift = (span_end - span_start).max(1);
+
+        let track_ids: Vec<TrackId> = self.project.tracks.iter().map(|t| t.id).collect();
+        let mut new_ids = Vec::new();
+        for tid in track_ids {
+            let copies: Vec<Clip> = self
+                .project
+                .track(tid)
+                .map(|t| t.clips.iter().filter(|c| c.selected).cloned().collect())
+                .unwrap_or_default();
+            for mut c in copies {
+                c.id = self.project.alloc_id();
+                c.start += shift;
+                c.selected = true;
+                new_ids.push(c.id);
+                if let Some(t) = self.project.track_mut(tid) {
+                    t.clips.push(c);
+                }
+            }
+        }
+        self.project.clear_selection();
+        for id in &new_ids {
+            if let Some(c) = self.project.clip_mut(*id) {
+                c.selected = true;
+            }
+        }
+        self.project.normalize();
+        self.notify(format!("Duplicated {} clip(s)", new_ids.len()));
+    }
+
+    /// Moves the selection by whole frames, for fine placement without the mouse.
+    pub fn nudge_selected(&mut self, frames: i64) {
+        let sel = self.project.selected_ids();
+        if sel.is_empty() {
+            return;
+        }
+        let min_start = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.selected)
+            .map(|c| c.start)
+            .min()
+            .unwrap_or(0);
+        let delta = frames.max(-min_start);
+        if delta == 0 {
+            return;
+        }
+        self.snapshot();
+        for t in &mut self.project.tracks {
+            if t.locked {
+                continue;
+            }
+            for c in &mut t.clips {
+                if c.selected {
+                    c.start += delta;
+                }
+            }
+            t.normalize();
+        }
+    }
+
     pub fn select_all(&mut self) {
         for t in &mut self.project.tracks {
             for c in &mut t.clips {
@@ -615,6 +710,56 @@ impl App {
     }
 
 
+    pub fn thumb(&self, media: MediaId, frame: u32) -> Option<egui::TextureId> {
+        self.thumbs.get(&(media, frame)).map(|t| t.id())
+    }
+
+    /// Uploads any requested thumbnail that is already decoded, and asks the decoder for a couple
+    /// of the missing ones. Deliberately bounded: the timeline must never wait on a decode.
+    pub fn upload_thumbs(&mut self, ctx: &Context, wanted: &[(MediaId, u32)]) {
+        const MAX_THUMBS: usize = 256;
+        const REQUESTS_PER_FRAME: usize = 3;
+        let mut requested = 0;
+
+        for &(mid, frame) in wanted {
+            if self.thumbs.contains_key(&(mid, frame)) {
+                continue;
+            }
+            match self.cache.peek(mid, frame) {
+                Some(img) => {
+                    // Thumbnails are small; downsample on upload so VRAM stays modest.
+                    let small = downsample(&img, 160);
+                    let tex = ctx.load_texture(
+                        format!("thumb{mid}_{frame}"),
+                        small,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumbs.insert((mid, frame), tex);
+                    self.thumb_order.push((mid, frame));
+                }
+                None => {
+                    if requested < REQUESTS_PER_FRAME {
+                        self.cache.prefetch(mid, frame, 1);
+                        requested += 1;
+                    }
+                }
+            }
+        }
+
+        while self.thumb_order.len() > MAX_THUMBS {
+            let k = self.thumb_order.remove(0);
+            self.thumbs.remove(&k);
+        }
+        if requested > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    }
+
+    pub fn drop_thumbs_for(&mut self, media: MediaId) {
+        self.thumb_order.retain(|(m, _)| *m != media);
+        self.thumbs.retain(|(m, _), _| *m != media);
+    }
+
     pub fn mark_audio_dirty(&mut self) {
         self.audio_dirty = true;
         self.dirty = true;
@@ -652,6 +797,7 @@ impl App {
         self.snapshot();
         self.project.media.retain(|m| m.id != id);
         self.cache.forget(id);
+        self.drop_thumbs_for(id);
         self.pcm.remove(&id);
         self.peaks.remove(&id);
         if self.selected_media == Some(id) {
@@ -697,6 +843,7 @@ impl App {
                 continue;
             }
             self.cache.forget(id);
+            self.drop_thumbs_for(id);
             self.pcm.remove(&id);
             self.peaks.remove(&id);
             if let Some(m) = self.project.media_mut(id) {
@@ -920,6 +1067,15 @@ impl App {
         if mods.command && pressed(Key::A) {
             self.select_all();
         }
+        if mods.command && pressed(Key::D) {
+            self.duplicate_selected();
+        }
+        if pressed(Key::Comma) {
+            self.nudge_selected(-step);
+        }
+        if pressed(Key::Period) {
+            self.nudge_selected(step);
+        }
         if mods.command && pressed(Key::S) {
             self.save(mods.shift);
         }
@@ -1139,6 +1295,48 @@ impl App {
         }
         self.tex[idx].id()
     }
+}
+
+/// Box-filters a decoded frame down to at most `max_w` wide for use as a timeline thumbnail.
+fn downsample(img: &crate::decode::DecodedFrame, max_w: u32) -> egui::ColorImage {
+    let (sw, sh) = (img.width.max(1), img.height.max(1));
+    if sw <= max_w {
+        return egui::ColorImage::from_rgba_unmultiplied([sw as usize, sh as usize], &img.rgba);
+    }
+    let n = (sw as f32 / max_w as f32).ceil() as u32;
+    let dw = (sw / n).max(1);
+    let dh = (sh / n).max(1);
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh {
+        for x in 0..dw {
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            let mut count = 0u32;
+            for sy in 0..n {
+                let py = y * n + sy;
+                if py >= sh {
+                    break;
+                }
+                for sx in 0..n {
+                    let px = x * n + sx;
+                    if px >= sw {
+                        break;
+                    }
+                    let i = ((py * sw + px) * 4) as usize;
+                    r += img.rgba[i] as u32;
+                    g += img.rgba[i + 1] as u32;
+                    b += img.rgba[i + 2] as u32;
+                    count += 1;
+                }
+            }
+            let count = count.max(1);
+            let o = ((y * dw + x) * 4) as usize;
+            out[o] = (r / count) as u8;
+            out[o + 1] = (g / count) as u8;
+            out[o + 2] = (b / count) as u8;
+            out[o + 3] = 255;
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &out)
 }
 
 fn default_export_path() -> PathBuf {

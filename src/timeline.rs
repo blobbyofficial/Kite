@@ -80,6 +80,60 @@ fn fit_to_window(app: &mut App, width: f32) {
     app.scroll_x = 0.0;
 }
 
+/// Frame interval between thumbnails on a clip. Quantised to a power of two so the thumbnails
+/// stay anchored to the clip while zooming instead of shimmering.
+fn thumb_step(px_per_frame: f32, thumb_w: f32) -> i64 {
+    let raw = (thumb_w / px_per_frame).max(1.0);
+    let p = raw.log2().round().clamp(0.0, 20.0);
+    (2f32.powf(p) as i64).max(1)
+}
+
+/// Uploads the thumbnails visible right now. Only frames already decoded are used, so this never
+/// blocks the UI thread; anything missing is queued and appears a frame or two later.
+fn ensure_thumbs(app: &mut App, ctx: &Context, lane: Rect, tracks_rect: Rect) {
+    let mut wanted: Vec<(crate::project::MediaId, u32)> = Vec::new();
+    let mut y = tracks_rect.top();
+    let first = frame_at(app, lane, lane.left()) - 1;
+    let last = frame_at(app, lane, lane.right()) + 1;
+
+    for t in &app.project.tracks {
+        let h = t.height;
+        if y > tracks_rect.bottom() {
+            break;
+        }
+        if t.kind != TrackKind::Video || h < 34.0 {
+            y += h;
+            continue;
+        }
+        let tw = (h - 6.0) * app.project.settings.aspect();
+        if tw >= 8.0 {
+            let step = thumb_step(app.px_per_frame, tw);
+            for c in &t.clips {
+                if c.end() < first || c.start > last {
+                    continue;
+                }
+                let Some(mid) = c.media_id() else { continue };
+                if !app.project.media(mid).map(|m| m.has_video).unwrap_or(false) {
+                    continue;
+                }
+                let mut k = 0i64;
+                while k * step < c.len && wanted.len() < 64 {
+                    let local = k * step;
+                    let x = x_of(app, lane, c.start + local);
+                    k += 1;
+                    if x + tw < lane.left() || x > lane.right() {
+                        continue;
+                    }
+                    wanted.push((mid, (c.src_in + local).max(0) as u32));
+                }
+            }
+        }
+        y += h;
+    }
+
+    app.upload_thumbs(ctx, &wanted);
+}
+
 fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
     let head_rect = Rect::from_min_max(rect.min, Pos2::new(rect.left() + HEADER_W, rect.bottom()));
     let lane_rect = Rect::from_min_max(Pos2::new(rect.left() + HEADER_W, rect.top()), rect.max);
@@ -129,6 +183,8 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
             app.scroll_x = app.scroll_x.clamp(0.0, max_scroll);
         }
     }
+
+    ensure_thumbs(app, ui.ctx(), lane_rect, tracks_rect);
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(head_rect, CornerRadius::ZERO, theme::PANEL_HI);
@@ -355,11 +411,50 @@ fn draw_track(
         let fill = if c.selected { hi } else { base };
         painter.rect_filled(cr, CornerRadius::same(3), fill);
 
+        // Thumbnails first, so the waveform and label sit on top of them.
+        if track.kind == TrackKind::Video && cr.height() >= 34.0 {
+            if let Some(mid) = c.media_id() {
+                let tw = (cr.height() - 4.0) * app.project.settings.aspect();
+                if tw >= 8.0 {
+                    let step = thumb_step(app.px_per_frame, tw);
+                    let strip = painter.with_clip_rect(cr.shrink(1.0));
+                    let mut k = 0i64;
+                    while k * step < c.len {
+                        let local = k * step;
+                        let x = x_of(app, r, c.start + local);
+                        k += 1;
+                        if x > cr.right() || x + tw < cr.left() {
+                            continue;
+                        }
+                        let Some(id) = app.thumb(mid, (c.src_in + local).max(0) as u32) else {
+                            continue;
+                        };
+                        let dest = Rect::from_min_size(
+                            Pos2::new(x, cr.top() + 2.0),
+                            Vec2::new(tw, cr.height() - 4.0),
+                        );
+                        strip.image(
+                            id,
+                            dest,
+                            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                    // Keep the name readable over the picture.
+                    strip.rect_filled(
+                        Rect::from_min_max(cr.min, Pos2::new(cr.right(), cr.top() + 15.0)),
+                        CornerRadius::ZERO,
+                        Color32::from_black_alpha(120),
+                    );
+                }
+            }
+        }
+
         // Audio waveform, drawn straight from the precomputed envelope.
         if track.kind == TrackKind::Audio || matches!(c.source, ClipSource::Media(_)) {
             if let Some(mid) = c.media_id() {
                 if let Some(peaks) = app.peaks_for(mid) {
-                    draw_waveform(app, painter, cr, c, peaks, track.kind == TrackKind::Audio);
+                    draw_waveform(app, painter, r, cr, c, peaks, track.kind == TrackKind::Audio);
                 }
             }
         }
@@ -437,6 +532,7 @@ fn draw_track(
 fn draw_waveform(
     app: &App,
     painter: &egui::Painter,
+    lane: Rect,
     cr: Rect,
     clip: &crate::project::Clip,
     peaks: &[(i16, i16)],
@@ -458,8 +554,8 @@ fn draw_waveform(
     let mut shapes = Vec::with_capacity(cols);
     for i in 0..cols {
         let x = cr.left() + i as f32;
-        let f0 = frame_at(app, cr, x);
-        let f1 = frame_at(app, cr, x + 1.0).max(f0 + 1);
+        let f0 = frame_at(app, lane, x);
+        let f1 = frame_at(app, lane, x + 1.0).max(f0 + 1);
         let src0 = clip.src_in + (f0 - clip.start);
         let src1 = clip.src_in + (f1 - clip.start);
         let b0 = (s.frame_to_sample(src0).max(0) as usize) / PEAK_BUCKET;
@@ -511,24 +607,39 @@ fn handle_interaction(
             }
             if let Some((_, c)) = app.project.clip(cid) {
                 let grab = frame_at(app, lane, p.x) - c.start;
-                let st = DragState {
-                    kind,
-                    clip: cid,
-                    from_track: tid,
-                    orig_start: c.start,
-                    orig_len: c.len,
-                    orig_src_in: c.src_in,
-                    grab,
-                    moved: false,
-                };
-                if !c.selected {
+                let (orig_start, orig_len, orig_src_in, was_selected) =
+                    (c.start, c.len, c.src_in, c.selected);
+                if !was_selected {
                     app.project.clear_selection();
                     if let Some(cm) = app.project.clip_mut(cid) {
                         cm.selected = true;
                     }
                 }
+                // Everything else that is selected travels with the grabbed clip.
+                let others: Vec<(ClipId, i64)> = if kind == DragKind::Move {
+                    app.project
+                        .tracks
+                        .iter()
+                        .filter(|t| !t.locked)
+                        .flat_map(|t| t.clips.iter())
+                        .filter(|o| o.selected && o.id != cid)
+                        .map(|o| (o.id, o.start))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 app.snapshot();
-                app.drag = Some(st);
+                app.drag = Some(DragState {
+                    kind,
+                    clip: cid,
+                    from_track: tid,
+                    orig_start,
+                    orig_len,
+                    orig_src_in,
+                    grab,
+                    moved: false,
+                    others,
+                });
             }
         } else if pointer.map(|p| tracks_rect.contains(p)).unwrap_or(false) {
             app.project.clear_selection();
@@ -545,6 +656,7 @@ fn handle_interaction(
             let orig_len = st.orig_len;
             let orig_src_in = st.orig_src_in;
             let from_track = st.from_track;
+            let others = st.others.clone();
             let raw = frame_at(app, lane, p.x);
 
             match kind {
@@ -560,6 +672,22 @@ fn handle_interaction(
                     }
                     .max(0);
 
+                    // Nothing may be pushed before the start of the timeline.
+                    let min_orig = others
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .chain(std::iter::once(orig_start))
+                        .min()
+                        .unwrap_or(orig_start);
+                    let delta = (new_start - orig_start).max(-min_orig);
+                    let new_start = orig_start + delta;
+
+                    for (oid, ostart) in &others {
+                        if let Some(oc) = app.project.clip_mut(*oid) {
+                            oc.start = ostart + delta;
+                        }
+                    }
+
                     let target_track = track_at_y(app, tracks_rect, p.y).unwrap_or(from_track);
                     let same_kind = app
                         .project
@@ -567,7 +695,11 @@ fn handle_interaction(
                         .zip(app.project.track(from_track))
                         .map(|(a, b)| a.kind == b.kind && !a.locked)
                         .unwrap_or(false);
-                    let dest = if same_kind { target_track } else { from_track };
+                    let dest = if same_kind && others.is_empty() {
+                        target_track
+                    } else {
+                        from_track
+                    };
 
                     if dest != from_track {
                         if let Some(mut c) = take_clip(app, from_track, cid) {

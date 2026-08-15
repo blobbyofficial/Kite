@@ -64,6 +64,10 @@ pub fn top_bar(app: &mut App, ctx: &Context) {
                         app.delete_selected(true);
                         ui.close();
                     }
+                    if ui.button("Duplicate      Ctrl+D").clicked() {
+                        app.duplicate_selected();
+                        ui.close();
+                    }
                     if ui.button("Select all     Ctrl+A").clicked() {
                         app.select_all();
                         ui.close();
@@ -647,6 +651,8 @@ fn shortcuts_window(app: &mut App, ctx: &Context) {
                 ("S  or  Ctrl+K", "Split at playhead"),
                 ("Del", "Delete selected clip"),
                 ("Shift + Del", "Ripple delete (close the gap)"),
+                ("Ctrl+D", "Duplicate selected clips"),
+                (", / .", "Nudge selection by a frame (Shift: a second)"),
                 ("M", "Toggle snapping"),
                 ("+ / −", "Zoom timeline"),
                 ("Ctrl + scroll", "Zoom around the pointer"),
