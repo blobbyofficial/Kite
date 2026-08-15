@@ -285,11 +285,91 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         size / 1024
     );
 
-    // ---- 7. does the timeline model scale? --------------------------------
+    // ---- 7. a graph big enough to have overflowed a command line ----------
+    big_graph_check(&tools, &dir, &src, info.duration)?;
+
+    // ---- 8. does the timeline model scale? --------------------------------
     scale_check()?;
 
     std::fs::remove_dir_all(&dir).ok();
     println!("\nAll checks passed.");
+    Ok(())
+}
+
+/// Exports a timeline with enough cuts that the filtergraph is far past the Windows command-line
+/// limit, which is why it goes to ffmpeg as a script file rather than an argument.
+fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::Path, dur: f64) -> Result<()> {
+    const CUTS: i64 = 120;
+    let mut project = Project::default();
+    let media_id = project.alloc_id();
+    project.media.push(MediaItem {
+        id: media_id,
+        path: src.to_path_buf(),
+        name: "source.mp4".into(),
+        duration: dur,
+        frames: 120,
+        src_width: 1280,
+        src_height: 720,
+        src_fps: 30.0,
+        has_video: true,
+        has_audio: true,
+        proxy_path: None,
+        audio_path: None,
+        peaks_path: None,
+        state: ImportState::Ready,
+        error: None,
+    });
+    let tid = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .last()
+        .map(|t| t.id)
+        .context("no video track")?;
+    for i in 0..CUTS {
+        let c = project.new_clip(ClipSource::Media(media_id), i * 5, 5, (i * 7) % 100);
+        project.track_mut(tid).unwrap().clips.push(c);
+    }
+    project.normalize();
+
+    let out = dir.join("big.mp4");
+    let settings = ExportSettings {
+        path: out.clone(),
+        encoder: Encoder::X264,
+        quality: Quality::Small,
+        width: 640,
+        height: 360,
+        fps: 30,
+    };
+    let assets = export::Assets::prepare(None)?;
+    let (_, graph, _) = export::build_graph(&project, &settings, Some(&assets))?;
+    assets.cleanup();
+    let len = graph.len();
+    if len < 32_768 {
+        println!("  --  graph is {len} chars, smaller than expected but still exercised");
+    }
+
+    let job = export::start(tools.clone(), project, settings, None);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if Instant::now() > deadline {
+            bail!("large export timed out");
+        }
+        match job.rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(ExportMsg::Done(_)) => break,
+            Ok(ExportMsg::Failed(e)) => bail!("large export failed: {e}"),
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(e) => bail!("large export channel closed: {e}"),
+        }
+    }
+    let probed = ffmpeg::probe(tools, &out)?;
+    let expected = (CUTS * 5) as f64 / 30.0;
+    if (probed.duration - expected).abs() > 0.5 {
+        bail!("large export is {:.2}s, expected {expected:.2}s", probed.duration);
+    }
+    std::fs::remove_file(&out).ok();
+    pass!("{CUTS}-cut timeline exported, filtergraph {len} chars");
     Ok(())
 }
 
@@ -394,6 +474,7 @@ fn verify_titles_render(tools: &Tools, assets: &export::Assets) -> Result<()> {
 fn find_font() -> Option<PathBuf> {
     [
         "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

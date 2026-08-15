@@ -506,7 +506,9 @@ fn run_export(
     for i in &inputs {
         cmd.arg("-i").arg(i);
     }
-    cmd.arg("-filter_complex").arg(&graph);
+    let graph_file = assets.dir.join("graph.txt");
+    std::fs::write(&graph_file, graph.as_bytes()).context("writing the filtergraph")?;
+    cmd.args(["-filter_complex_script", "graph.txt"]);
     cmd.args(["-map", "[vout]"]);
     if has_audio {
         cmd.args(["-map", "[aout]"]);

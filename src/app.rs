@@ -1351,8 +1351,11 @@ fn default_export_path() -> PathBuf {
 fn export_font() -> Option<PathBuf> {
     let candidates = [
         "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/seguisb.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
