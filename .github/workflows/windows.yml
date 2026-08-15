@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
@@ -81,3 +84,22 @@ jobs:
           path: dist/*.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "beta-$env:GITHUB_RUN_NUMBER"
+          $notes = @"
+          Windows installer for the Kite beta. Download ``KiteSetup-*.exe`` below and run it.
+          ffmpeg is bundled, so there is nothing else to install.
+
+          Built from ``$env:GITHUB_SHA``. Every build runs the full self-test first: import,
+          random-access decode, title rendering, export, and a 120-cut timeline.
+
+          See docs/BETA-README.md for the keyboard shortcuts and what is and is not in this build.
+          "@
+          gh release create $tag (Get-ChildItem dist/*.exe | ForEach-Object { $_.FullName }) `
+            --title "Kite beta $env:GITHUB_RUN_NUMBER" --notes $notes --latest
+          if ($LASTEXITCODE -ne 0) { throw "release publish failed" }

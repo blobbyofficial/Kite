@@ -9,10 +9,9 @@ the first step of.
 
 ## The beta
 
-A Windows installer is produced by CI on every push. Grab it from the
-[Actions tab](../../actions) → latest **Windows installer** run → **Artifacts** →
-`KiteSetup-windows`. Install and you can cut a video immediately; ffmpeg is bundled, so there is
-nothing else to set up.
+**[Download the installer from Releases](../../releases/latest)** — run `KiteSetup-*.exe` and you
+can cut a video immediately. ffmpeg is bundled, so there is nothing else to set up. Every push
+also leaves the installer as a build artifact on the [Actions tab](../../actions).
 
 Start with [docs/BETA-README.md](docs/BETA-README.md).
 
