@@ -245,7 +245,12 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     if !has_audio {
         bail!("export graph produced no audio");
     }
-    step!("filtergraph is {} chars over {} input(s)", graph.len(), inputs.len());
+    step!(
+        "filtergraph is {} chars over {} input(s), passed as {:?}",
+        graph.len(),
+        inputs.len(),
+        export::graph_arg(&tools)
+    );
 
     assets.cleanup();
     let t0 = Instant::now();

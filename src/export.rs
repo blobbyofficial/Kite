@@ -123,6 +123,64 @@ pub fn available_encoders(tools: &Tools) -> Vec<Encoder> {
     out
 }
 
+/// How this ffmpeg build accepts a filtergraph that is too large to pass as an argument.
+///
+/// `-filter_complex_script` was the long-standing spelling; ffmpeg 7 introduced the generic
+/// `-/option file` form and ffmpeg 8 removed the old one. Bundled builds move, so rather than
+/// guess from a version banner we ask ffmpeg once and remember the answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GraphArg {
+    /// `-/filter_complex file` — ffmpeg 7 and later.
+    SlashFile,
+    /// `-filter_complex_script file` — ffmpeg 6 and earlier.
+    ScriptFile,
+    /// Neither worked; pass it inline and hope it fits the command line.
+    Inline,
+}
+
+static GRAPH_ARG: std::sync::OnceLock<GraphArg> = std::sync::OnceLock::new();
+
+pub fn graph_arg(tools: &Tools) -> GraphArg {
+    *GRAPH_ARG.get_or_init(|| detect_graph_arg(tools))
+}
+
+fn detect_graph_arg(tools: &Tools) -> GraphArg {
+    let dir = std::env::temp_dir().join(format!("kite-probe-{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return GraphArg::Inline;
+    }
+    let name = "probe_graph.txt";
+    if std::fs::write(dir.join(name), b"[0:v]null[vout]").is_err() {
+        std::fs::remove_dir_all(&dir).ok();
+        return GraphArg::Inline;
+    }
+
+    let mut found = GraphArg::Inline;
+    for style in [GraphArg::SlashFile, GraphArg::ScriptFile] {
+        let mut cmd = ffmpeg::command(&tools.ffmpeg);
+        cmd.current_dir(&dir);
+        cmd.args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x32:d=0.1"]);
+        match style {
+            GraphArg::SlashFile => cmd.args(["-/filter_complex", name]),
+            GraphArg::ScriptFile => cmd.args(["-filter_complex_script", name]),
+            GraphArg::Inline => unreachable!(),
+        };
+        cmd.args(["-map", "[vout]", "-frames:v", "1", "-f", "null", "-"]);
+        let ok = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            found = style;
+            break;
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    found
+}
+
 /// Files the filtergraph needs to reference by name.
 ///
 /// Quoting a Windows path inside an ffmpeg filtergraph is a well-known source of breakage: the
@@ -506,9 +564,23 @@ fn run_export(
     for i in &inputs {
         cmd.arg("-i").arg(i);
     }
-    let graph_file = assets.dir.join("graph.txt");
-    std::fs::write(&graph_file, graph.as_bytes()).context("writing the filtergraph")?;
-    cmd.args(["-filter_complex_script", "graph.txt"]);
+    // A real edit produces a graph far larger than a Windows command line allows, so it goes to
+    // ffmpeg in a file whenever this build supports it.
+    match graph_arg(tools) {
+        GraphArg::SlashFile => {
+            std::fs::write(assets.dir.join("graph.txt"), graph.as_bytes())
+                .context("writing the filtergraph")?;
+            cmd.args(["-/filter_complex", "graph.txt"]);
+        }
+        GraphArg::ScriptFile => {
+            std::fs::write(assets.dir.join("graph.txt"), graph.as_bytes())
+                .context("writing the filtergraph")?;
+            cmd.args(["-filter_complex_script", "graph.txt"]);
+        }
+        GraphArg::Inline => {
+            cmd.arg("-filter_complex").arg(&graph);
+        }
+    }
     cmd.args(["-map", "[vout]"]);
     if has_audio {
         cmd.args(["-map", "[aout]"]);

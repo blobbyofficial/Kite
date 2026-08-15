@@ -63,9 +63,23 @@ fn main() -> eframe::Result<()> {
         .map(std::path::PathBuf::from)
         .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("kite")));
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Kite",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, tools, open_path)))),
-    )
+    );
+
+    // A GUI-subsystem binary has nowhere to print, so a failure to open the window would
+    // otherwise look like the application simply not starting.
+    if let Err(e) = &result {
+        rfd::MessageDialog::new()
+            .set_title("Kite could not start")
+            .set_description(format!(
+                "{e}\n\nThis usually means the graphics driver could not provide a Direct3D 12 \
+                 or Vulkan device. Updating your graphics driver normally fixes it."
+            ))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
+    result
 }
