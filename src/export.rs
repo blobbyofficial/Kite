@@ -123,6 +123,62 @@ pub fn available_encoders(tools: &Tools) -> Vec<Encoder> {
     out
 }
 
+/// Files the filtergraph needs to reference by name.
+///
+/// Quoting a Windows path inside an ffmpeg filtergraph is a well-known source of breakage: the
+/// drive-letter colon is an option separator, and getting the escaping subtly wrong makes ffmpeg
+/// either fail outright or quietly substitute a fallback font. Instead we stage the font and the
+/// title text in one directory, run ffmpeg with that as its working directory, and refer to them
+/// by bare filename. There is then nothing to escape.
+pub struct Assets {
+    pub dir: PathBuf,
+    pub font_file: Option<String>,
+    counter: std::cell::Cell<usize>,
+}
+
+impl Assets {
+    pub fn prepare(font: Option<&Path>) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "kite-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).context("creating the render staging directory")?;
+        let font_file = match font {
+            Some(src) => {
+                let ext = src
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_else(|| "ttf".into());
+                let name = format!("font.{ext}");
+                std::fs::copy(src, dir.join(&name))
+                    .with_context(|| format!("copying the title font from {}", src.display()))?;
+                Some(name)
+            }
+            None => None,
+        };
+        Ok(Self { dir, font_file, counter: std::cell::Cell::new(0) })
+    }
+
+    /// Writes title text to its own file so the text itself never needs escaping either —
+    /// quotes, colons, percent signs, newlines and emoji all pass through untouched.
+    fn write_text(&self, text: &str) -> Result<String> {
+        let n = self.counter.get();
+        self.counter.set(n + 1);
+        let name = format!("text{n}.txt");
+        std::fs::write(self.dir.join(&name), text.as_bytes())
+            .context("writing title text for the renderer")?;
+        Ok(name)
+    }
+
+    pub fn cleanup(&self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
 fn f(t: f64) -> String {
     format!("{t:.6}")
 }
@@ -160,7 +216,7 @@ impl Graph {
 pub fn build_graph(
     project: &Project,
     settings: &ExportSettings,
-    font: Option<&Path>,
+    assets: Option<&Assets>,
 ) -> Result<(Vec<PathBuf>, String, bool)> {
     let w = settings.width as i64;
     let h = settings.height as i64;
@@ -278,7 +334,10 @@ pub fn build_graph(
                     current = out;
                 }
                 ClipSource::Text(tp) => {
-                    let Some(fontfile) = font else { continue };
+                    // Without a usable font we skip titles rather than emit a graph that fails.
+                    let Some(assets) = assets else { continue };
+                    let Some(fontname) = assets.font_file.as_deref() else { continue };
+                    let textfile = assets.write_text(&tp.text)?;
                     let size = (tp.size * h as f32).round().max(8.0) as i64;
                     let x_expr = match tp.align {
                         TextAlign::Left => format!("{}", (tp.x * w as f32).round() as i64),
@@ -292,10 +351,9 @@ pub fn build_graph(
                     let y = (tp.y * h as f32).round() as i64 - size / 2;
                     let out = g.label("c");
                     let mut d = format!(
-                        "[{current}]drawtext=fontfile='{}':text='{}':fontsize={size}\
+                        "[{current}]drawtext=fontfile={fontname}:textfile={textfile}\
+                         :expansion=none:fontsize={size}\
                          :fontcolor=0x{:02x}{:02x}{:02x}@{:.3}:x={x_expr}:y={y}",
-                        ffmpeg::escape_filter_path(fontfile),
-                        ffmpeg::escape_drawtext(&tp.text),
                         tp.color[0],
                         tp.color[1],
                         tp.color[2],
@@ -403,7 +461,15 @@ pub fn start(
         .name("kite-export".into())
         .spawn(move || {
             let total_frames = project.duration();
-            let res = run_export(&tools, &project, &s2, font.as_deref(), total_frames, &tx, &c2);
+            let assets = match Assets::prepare(font.as_deref()) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(ExportMsg::Failed(format!("{e:#}")));
+                    return;
+                }
+            };
+            let res = run_export(&tools, &project, &s2, &assets, total_frames, &tx, &c2);
+            assets.cleanup();
             match res {
                 Ok(()) => {
                     if c2.load(Ordering::Relaxed) {
@@ -426,14 +492,16 @@ fn run_export(
     tools: &Tools,
     project: &Project,
     settings: &ExportSettings,
-    font: Option<&Path>,
+    assets: &Assets,
     total_frames: i64,
     tx: &crossbeam_channel::Sender<ExportMsg>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let (inputs, graph, has_audio) = build_graph(project, settings, font)?;
+    let (inputs, graph, has_audio) = build_graph(project, settings, Some(assets))?;
 
     let mut cmd = ffmpeg::command(&tools.ffmpeg);
+    // Everything the filtergraph names is in here, referenced without a path.
+    cmd.current_dir(&assets.dir);
     cmd.args(["-hide_banner", "-v", "error", "-nostdin", "-y"]);
     for i in &inputs {
         cmd.arg("-i").arg(i);
@@ -509,11 +577,13 @@ fn run_export(
         if let Some(mut e) = child.stderr.take() {
             e.read_to_string(&mut err).ok();
         }
-        let detail = err
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("ffmpeg exited with an error");
+        let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let detail = if lines.is_empty() {
+            "ffmpeg exited with an error but said nothing".to_string()
+        } else {
+            // Keep the tail, which is where ffmpeg puts the reason, but enough of it to act on.
+            lines[lines.len().saturating_sub(6)..].join("  |  ")
+        };
         bail!("{detail}");
     }
     Ok(())

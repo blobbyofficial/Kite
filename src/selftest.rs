@@ -236,7 +236,9 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     if font.is_none() {
         println!("  --  no TrueType font found, titles will be skipped in this run");
     }
-    let (inputs, graph, has_audio) = export::build_graph(&project, &settings, font.as_deref())?;
+    let assets = export::Assets::prepare(font.as_deref())?;
+    verify_titles_render(&tools, &assets)?;
+    let (inputs, graph, has_audio) = export::build_graph(&project, &settings, Some(&assets))?;
     if inputs.len() != 1 {
         bail!("expected one input file, got {}", inputs.len());
     }
@@ -245,8 +247,9 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     }
     step!("filtergraph is {} chars over {} input(s)", graph.len(), inputs.len());
 
+    assets.cleanup();
     let t0 = Instant::now();
-    let job = export::start(tools.clone(), project.clone(), settings, font);
+    let job = export::start(tools.clone(), project.clone(), settings, font.clone());
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         if Instant::now() > deadline {
@@ -282,8 +285,109 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         size / 1024
     );
 
+    // ---- 7. does the timeline model scale? --------------------------------
+    scale_check()?;
+
     std::fs::remove_dir_all(&dir).ok();
     println!("\nAll checks passed.");
+    Ok(())
+}
+
+/// The timeline has to stay responsive on a feature-length edit, so check that the operations the
+/// UI performs every frame do not degrade with clip count.
+fn scale_check() -> Result<()> {
+    const CLIPS: i64 = 10_000;
+    let mut project = Project::default();
+    let tid = project
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .map(|t| t.id)
+        .context("no video track")?;
+
+    let t0 = Instant::now();
+    for i in 0..CLIPS {
+        let c = project.new_clip(ClipSource::Color([20, 20, 20, 255]), i * 30, 30, 0);
+        project.track_mut(tid).unwrap().clips.push(c);
+    }
+    project.normalize();
+    let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if project.duration() != CLIPS * 30 {
+        bail!("duration wrong after building {CLIPS} clips");
+    }
+
+    // clip_at is a binary search and runs for every track on every drawn frame.
+    let track = project.track(tid).context("track vanished")?;
+    let t0 = Instant::now();
+    let mut found = 0u32;
+    for i in 0..200_000i64 {
+        let f = (i * 7919) % (CLIPS * 30);
+        if track.clip_at(f).is_some() {
+            found += 1;
+        }
+    }
+    let lookup_ns = t0.elapsed().as_nanos() as f64 / 200_000.0;
+    if found != 200_000 {
+        bail!("clip_at missed {} lookups", 200_000 - found);
+    }
+
+    // A snapshot happens on every edit, so cloning the document must stay cheap.
+    let t0 = Instant::now();
+    let clone = project.clone();
+    let clone_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if clone.duration() != project.duration() {
+        bail!("clone did not preserve the timeline");
+    }
+
+    if lookup_ns > 1000.0 {
+        bail!("clip lookup took {lookup_ns:.0} ns, expected well under a microsecond");
+    }
+    pass!(
+        "{CLIPS} clips: built in {build_ms:.0} ms, lookup {lookup_ns:.0} ns, undo snapshot {clone_ms:.1} ms"
+    );
+    Ok(())
+}
+
+/// Renders white text on black and counts the bright pixels.
+///
+/// ffmpeg builds with fontconfig quietly substitute a fallback font when `fontfile` cannot be
+/// opened, so "the export succeeded" is not evidence that titles work. This checks that pixels
+/// actually changed.
+fn verify_titles_render(tools: &Tools, assets: &export::Assets) -> Result<()> {
+    let Some(font) = assets.font_file.as_deref() else {
+        println!("  --  skipping the title check, no font available");
+        return Ok(());
+    };
+    std::fs::write(assets.dir.join("probe.txt"), b"HELLO")?;
+
+    let out = ffmpeg::command(&tools.ffmpeg)
+        .current_dir(&assets.dir)
+        .args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:d=1"])
+        .args([
+            "-filter_complex",
+            &format!(
+                "[0:v]drawtext=fontfile={font}:textfile=probe.txt:expansion=none\
+                 :fontsize=120:fontcolor=white:x=20:y=100[o]"
+            ),
+        ])
+        .args(["-map", "[o]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("running the title render check")?;
+
+    if !out.status.success() {
+        bail!(
+            "titles do not render: {}",
+            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown")
+        );
+    }
+    let bright = out.stdout.iter().filter(|b| **b > 200).count();
+    if bright < 500 {
+        bail!("the title font drew only {bright} bright pixels — text is not being rendered");
+    }
+    pass!("titles render ({bright} pixels drawn)");
     Ok(())
 }
 

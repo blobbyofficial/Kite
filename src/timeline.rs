@@ -88,6 +88,24 @@ fn thumb_step(px_per_frame: f32, thumb_w: f32) -> i64 {
     (2f32.powf(p) as i64).max(1)
 }
 
+/// The half-open range of thumbnail indices on a clip that can appear in `[first, last]`.
+fn visible_thumb_range(
+    start: i64,
+    len: i64,
+    step: i64,
+    span_frames: f32,
+    first: i64,
+    last: i64,
+) -> (i64, i64) {
+    let count = (len + step - 1) / step;
+    // A thumbnail drawn at index k covers roughly [k*step, k*step + span_frames).
+    let lo = ((first - start) as f32 - span_frames) / step as f32;
+    let hi = (last - start) as f32 / step as f32;
+    let k0 = (lo.floor() as i64).clamp(0, count);
+    let k1 = (hi.ceil() as i64 + 1).clamp(k0, count);
+    (k0, k1)
+}
+
 /// Uploads the thumbnails visible right now. Only frames already decoded are used, so this never
 /// blocks the UI thread; anything missing is queued and appears a frame or two later.
 fn ensure_thumbs(app: &mut App, ctx: &Context, lane: Rect, tracks_rect: Rect) {
@@ -116,15 +134,13 @@ fn ensure_thumbs(app: &mut App, ctx: &Context, lane: Rect, tracks_rect: Rect) {
                 if !app.project.media(mid).map(|m| m.has_video).unwrap_or(false) {
                     continue;
                 }
-                let mut k = 0i64;
-                while k * step < c.len && wanted.len() < 64 {
-                    let local = k * step;
-                    let x = x_of(app, lane, c.start + local);
-                    k += 1;
-                    if x + tw < lane.left() || x > lane.right() {
-                        continue;
+                let span = tw / app.px_per_frame;
+                let (k0, k1) = visible_thumb_range(c.start, c.len, step, span, first, last);
+                for k in k0..k1 {
+                    if wanted.len() >= 64 {
+                        break;
                     }
-                    wanted.push((mid, (c.src_in + local).max(0) as u32));
+                    wanted.push((mid, (c.src_in + k * step).max(0) as u32));
                 }
             }
         }
@@ -418,11 +434,17 @@ fn draw_track(
                 if tw >= 8.0 {
                     let step = thumb_step(app.px_per_frame, tw);
                     let strip = painter.with_clip_rect(cr.shrink(1.0));
-                    let mut k = 0i64;
-                    while k * step < c.len {
+                    let (k0, k1) = visible_thumb_range(
+                        c.start,
+                        c.len,
+                        step,
+                        tw / app.px_per_frame,
+                        first_frame,
+                        last_frame,
+                    );
+                    for k in k0..k1 {
                         let local = k * step;
                         let x = x_of(app, r, c.start + local);
-                        k += 1;
                         if x > cr.right() || x + tw < cr.left() {
                             continue;
                         }
