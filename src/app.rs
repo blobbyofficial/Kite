@@ -1366,8 +1366,11 @@ fn export_font() -> Option<PathBuf> {
 fn reveal(path: &std::path::Path) {
     #[cfg(windows)]
     {
-        let mut c = std::process::Command::new("explorer");
-        c.arg("/select,").arg(path);
+        // Explorer wants the switch and the path as one token; passing them separately opens the
+        // documents folder instead of selecting the file.
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("explorer.exe");
+        c.raw_arg(format!("/select,\"{}\"", path.display()));
         let _ = c.spawn();
     }
     #[cfg(not(windows))]

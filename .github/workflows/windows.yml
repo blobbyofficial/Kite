@@ -54,8 +54,11 @@ jobs:
           # full import -> decode -> export pipeline against a synthesised clip.
           New-Item -ItemType Directory -Force -Path target/release/ffmpeg | Out-Null
           Copy-Item dist/ffmpeg/*.exe target/release/ffmpeg/
-          & target/release/kite.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "self-test failed with code $LASTEXITCODE" }
+          # kite.exe is a GUI-subsystem binary, so PowerShell will not block on `&` and
+          # $LASTEXITCODE stays stale. Start-Process -Wait is the reliable way to get the code.
+          $p = Start-Process -FilePath target/release/kite.exe -ArgumentList "--selftest" `
+                 -NoNewWindow -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test failed with code $($p.ExitCode)" }
 
       - name: Build installer
         shell: pwsh
