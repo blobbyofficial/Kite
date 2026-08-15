@@ -86,6 +86,7 @@ jobs:
           retention-days: 30
 
       - name: Publish release
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in Kite behaved incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying the beta. The details below are what make a problem reproducible —
+        the more of them you can fill in, the faster it gets fixed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kite version
+      description: Shown under Help → the version line. Or the installer filename.
+      placeholder: "0.1.0"
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and graphics card
+      placeholder: "Windows 11 23H2, Intel UHD 620"
+  - type: textarea
+    id: media
+    attributes:
+      label: The media involved
+      description: >
+        Camera or source, resolution, frame rate and format if you know them. Media-specific
+        problems are the most common kind, and this is usually the fastest route to a fix.
+      placeholder: "iPhone 4K 60fps HEVC, about 12 minutes"
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Self-test output (optional, helps a lot)
+      description: >
+        Run `kite --selftest` from a terminal in the install folder and paste the output. It
+        checks the whole import, decode and export pipeline.
+      render: text

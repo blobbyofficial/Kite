@@ -1,0 +1,52 @@
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deployments at once, but let a queued one finish rather than cancelling it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point every link at this repository
+        run: |
+          # The page ships with a __REPO__ placeholder so renaming the repository does not
+          # leave dead links behind; the real owner/name is only known at deploy time.
+          sed -i "s|__REPO__|${GITHUB_REPOSITORY}|g" site/index.html
+          if grep -q "__REPO__" site/index.html; then
+            echo "placeholder was not fully substituted" >&2
+            exit 1
+          fi
+          echo "linked to ${GITHUB_REPOSITORY}"
+
+      - name: Configure Pages
+        # enablement turns Pages on the first time, so this needs no manual setup.
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

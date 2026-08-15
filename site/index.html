@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kite — a video editor that stays fast on a modest laptop</title>
+<meta name="description" content="A free Windows video editor built so that scrubbing, trimming and cutting stay instant on ordinary hardware. Open source, ffmpeg bundled, nothing to configure.">
+<meta property="og:title" content="Kite — a video editor that stays fast on a modest laptop">
+<meta property="og:description" content="Seeking costs the same as playing forward. 1.3 ms per frame, 10,000-clip timelines, no lag.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%23181B23'/><path d='M22 18 L46 32 L22 46 Z' fill='%23FF5FA5'/></svg>">
+<style>
+  :root{
+    --ground:#0E1014; --panel:#171A21; --panel-2:#1E222B;
+    --line:#262C39; --line-2:#39414F;
+    --ink:#DCE1EA; --dim:#8A93A3; --faint:#666E7D;
+    --accent:#FF5FA5; --accent-deep:#3A1526;
+    --meas:#4ACADA; --good:#4FC98A; --warn:#D9A128;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){html{scroll-behavior:auto} *{transition:none!important;animation:none!important}}
+  body{
+    margin:0; background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:16.5px; line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:900px; margin:0 auto; padding:0 22px}
+  .prose{max-width:66ch}
+  a{color:var(--accent); text-underline-offset:2px; text-decoration-thickness:1px}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--accent); outline-offset:3px}
+  h1,h2,h3{font-family:var(--mono); letter-spacing:-.03em; text-wrap:balance; margin:0}
+  p{margin:0 0 18px}
+  code{font-family:var(--mono); font-size:.88em; background:var(--panel-2); padding:1px 5px; border-radius:2px}
+
+  /* ---------- masthead ---------- */
+  header{border-bottom:1px solid var(--line); background:var(--panel)}
+  .bar{display:flex; align-items:center; gap:12px; padding:14px 0}
+  .logo{display:flex; align-items:center; gap:9px; font-family:var(--mono); font-weight:600; letter-spacing:-.02em; font-size:17px; color:var(--ink); text-decoration:none}
+  .logo svg{display:block}
+  .bar nav{margin-left:auto; display:flex; gap:20px; font-family:var(--mono); font-size:12.5px}
+  .bar nav a{color:var(--dim); text-decoration:none}
+  .bar nav a:hover{color:var(--accent)}
+  @media (max-width:620px){.bar nav a.hide-sm{display:none}}
+
+  /* ---------- hero ---------- */
+  .hero{padding:72px 0 56px; border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono); font-size:11.5px; letter-spacing:.18em; text-transform:uppercase; color:var(--accent); margin:0 0 20px}
+  h1{font-size:clamp(30px,5.6vw,54px); line-height:1.05; font-weight:600; max-width:17ch; margin-bottom:22px}
+  .lede{font-size:clamp(17px,2.2vw,20px); color:var(--dim); max-width:60ch; margin-bottom:30px}
+  .cta{display:flex; flex-wrap:wrap; gap:12px; align-items:center}
+  .btn{
+    display:inline-flex; align-items:center; gap:9px; font-family:var(--mono); font-size:14.5px;
+    padding:13px 22px; border:1px solid var(--accent); background:var(--accent); color:#1A0510;
+    font-weight:600; text-decoration:none; border-radius:2px; transition:filter .12s;
+  }
+  .btn:hover{filter:brightness(1.12)}
+  .btn.ghost{background:transparent; color:var(--ink); border-color:var(--line-2)}
+  .btn.ghost:hover{border-color:var(--accent); color:var(--accent); filter:none}
+  .cta-note{font-family:var(--mono); font-size:12px; color:var(--faint); margin:14px 0 0}
+
+  /* ---------- stat strip ---------- */
+  .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); border:1px solid var(--line); background:var(--panel); margin:38px 0 0}
+  .stat{padding:16px 18px; border-right:1px solid var(--line)}
+  .stat:last-child{border-right:0}
+  @media (max-width:680px){.stat{border-right:0; border-bottom:1px solid var(--line)} .stat:last-child{border-bottom:0}}
+  .stat dt{font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--faint); margin:0 0 7px}
+  .stat dd{margin:0; font-family:var(--mono); font-size:19px; font-weight:600; letter-spacing:-.03em; font-variant-numeric:tabular-nums; color:var(--ink)}
+  .stat dd span{font-size:12px; color:var(--dim); font-weight:400}
+
+  /* ---------- sections ---------- */
+  section{padding:60px 0; border-bottom:1px solid var(--line)}
+  h2{font-size:13px; letter-spacing:.16em; text-transform:uppercase; font-weight:600; padding-bottom:12px; border-bottom:1px solid var(--line-2); margin-bottom:26px; display:flex; gap:12px; align-items:baseline}
+  h2 .n{color:var(--accent); font-variant-numeric:tabular-nums}
+  h3{font-size:16px; margin:32px 0 9px}
+
+  /* ---------- feature grid ---------- */
+  .grid{display:grid; gap:1px; background:var(--line); border:1px solid var(--line); margin:0 0 8px}
+  @media (min-width:720px){.grid.two{grid-template-columns:1fr 1fr}}
+  .cell{background:var(--panel); padding:20px 22px}
+  .cell h3{margin:0 0 8px; font-size:14.5px}
+  .cell p{margin:0; font-size:14.5px; line-height:1.55; color:var(--dim)}
+  .cell .tag{font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--meas); display:block; margin:0 0 10px}
+
+  /* ---------- figure ---------- */
+  figure{margin:30px 0 0; border:1px solid var(--line); background:var(--panel); padding:24px 20px 14px}
+  figure svg{display:block; width:100%; height:auto}
+  figcaption{font-family:var(--mono); font-size:11.5px; line-height:1.5; color:var(--faint); margin-top:15px; padding-top:12px; border-top:1px solid var(--line)}
+
+  /* ---------- tables ---------- */
+  .tw{overflow-x:auto; border:1px solid var(--line); background:var(--panel); margin:0 0 18px}
+  table{border-collapse:collapse; width:100%; min-width:460px; font-size:14.5px}
+  th,td{text-align:left; padding:11px 16px; border-bottom:1px solid var(--line); vertical-align:top}
+  thead th{font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--faint); font-weight:600; background:var(--panel-2); white-space:nowrap}
+  tbody tr:last-child td{border-bottom:0}
+  td.k{font-family:var(--mono); font-size:12.5px; color:var(--accent); white-space:nowrap}
+  td.y{color:var(--good)} td.n{color:var(--faint)}
+
+  /* ---------- steps ---------- */
+  ol.steps{list-style:none; counter-reset:s; margin:0; padding:0}
+  ol.steps li{counter-increment:s; display:grid; grid-template-columns:34px 1fr; gap:0 16px; padding:14px 0; border-top:1px solid var(--line)}
+  ol.steps li:last-child{border-bottom:1px solid var(--line)}
+  ol.steps li::before{content:counter(s); font-family:var(--mono); font-size:14px; font-weight:600; color:var(--accent)}
+  ol.steps p{margin:0; font-size:15px}
+  ol.steps strong{color:var(--ink)}
+
+  /* ---------- notices ---------- */
+  .note{border-left:3px solid var(--warn); background:var(--panel); padding:16px 20px; margin:0 0 20px}
+  .note.accent{border-left-color:var(--accent)}
+  .note p{margin:0 0 10px; font-size:14.5px; color:var(--dim)}
+  .note p:last-child{margin:0}
+  .note strong{color:var(--ink)}
+
+  /* ---------- download ---------- */
+  #download{background:var(--panel)}
+  .dl{display:flex; flex-wrap:wrap; gap:26px; align-items:flex-start; justify-content:space-between}
+  .dl-main{flex:1 1 320px}
+  .dl-meta{flex:0 1 260px; font-family:var(--mono); font-size:12.5px; color:var(--dim)}
+  .dl-meta div{display:flex; justify-content:space-between; gap:16px; padding:7px 0; border-bottom:1px solid var(--line)}
+  .dl-meta span:last-child{color:var(--ink); text-align:right}
+
+  kbd{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); border:1px solid var(--line-2); border-bottom-width:2px; border-radius:3px; padding:1px 6px; color:var(--ink); white-space:nowrap}
+
+  footer{padding:40px 0 60px; font-family:var(--mono); font-size:12px; color:var(--faint)}
+  footer a{color:var(--dim)}
+  footer p{margin:0 0 8px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap bar">
+    <a class="logo" href="#top">
+      <svg width="22" height="22" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="12" fill="#1E222B"/><path d="M22 18 L46 32 L22 46 Z" fill="#FF5FA5"/></svg>
+      Kite
+    </a>
+    <nav>
+      <a href="#why">Why</a>
+      <a href="#how" class="hide-sm">How it works</a>
+      <a href="#scope" class="hide-sm">Scope</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/__REPO__">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<div class="wrap hero">
+  <p class="eyebrow">Free · Open source · Windows</p>
+  <h1>A video editor that stays fast on a modest laptop</h1>
+  <p class="lede">Most editors get slow exactly when you need them most: scrubbing a long clip,
+  trimming frame by frame, cutting a talking-head take down to size. Kite is built so those
+  things stay instant on ordinary hardware.</p>
+  <div class="cta">
+    <a class="btn" href="https://github.com/__REPO__/releases/latest">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1v8.6l3.3-3.3 1 1L8 12 3.7 7.3l1-1L8 9.6V1zM2 13h12v1.5H2z"/></svg>
+      Download for Windows
+    </a>
+    <a class="btn ghost" href="#download">What's in the box</a>
+  </div>
+  <p class="cta-note">Windows 10/11, 64-bit · about 86&nbsp;MB · ffmpeg bundled, nothing else to install</p>
+
+  <dl class="stats">
+    <div class="stat"><dt>Frame decode</dt><dd>1.3 ms</dd></div>
+    <div class="stat"><dt>Seek cost</dt><dd>same <span>as playing forward</span></dd></div>
+    <div class="stat"><dt>Clip lookup</dt><dd>58 ns <span>at 10k clips</span></dd></div>
+    <div class="stat"><dt>Undo</dt><dd>0.2 ms</dd></div>
+  </dl>
+</div>
+
+<section id="why">
+  <div class="wrap">
+    <h2><span class="n">01</span> Why you might want this</h2>
+    <div class="prose">
+      <p>Editing a twenty-minute video on a five-year-old laptop is miserable in most tools. You
+      drag the playhead and the picture catches up a second later. You trim a clip and the whole
+      window hitches. The usual advice is to make proxies yourself, in a submenu, before you start.</p>
+      <p>Kite does that for you, automatically, the moment you import — and it is the reason
+      everything else feels immediate.</p>
+    </div>
+
+    <div class="grid two">
+      <div class="cell">
+        <span class="tag">Scrubbing</span>
+        <h3>Seeking is not a special case</h3>
+        <p>Jump to any frame, anywhere in a file, and it costs the same as playing the next one.
+        No waiting for the picture to resolve, no guessing where you are.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Long timelines</span>
+        <h3>Hour two feels like minute one</h3>
+        <p>Cost is driven by what is on screen, not by how much is on the timeline. A ten-thousand
+        clip sequence responds as quickly as an empty one.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Quality</span>
+        <h3>Edit on proxies, export the originals</h3>
+        <p>The fast playback files are for editing only. Export reads your original footage, so
+        the file you upload is full quality no matter what you scrubbed against.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Nothing to set up</span>
+        <h3>Install and cut</h3>
+        <p>ffmpeg comes bundled. No codec packs, no render settings to learn first, no account,
+        no cloud, no telemetry. It opens and you start.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2><span class="n">02</span> How it actually works</h2>
+    <div class="prose">
+      <p>Camera and screen-capture footage is nearly always long-GOP H.264 or HEVC: most frames are
+      stored as differences from earlier ones. To show frame 4,000 the decoder may have to walk
+      through hundreds of frames first. That is the stutter you feel when you scrub.</p>
+      <p>On import, Kite transcodes each file once into an indexed format where every frame stands
+      alone. After that, finding a frame is a lookup in a table.</p>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 700 210" role="img" aria-label="Diagram: seeking in long-GOP footage requires decoding a long run of frames, whereas Kite's indexed format resolves any frame with one lookup and one decode.">
+        <text x="0" y="13" font-family="ui-monospace,monospace" font-size="11" letter-spacing="0.4" fill="#8A93A3">LONG-GOP SOURCE — SEEK TO AN ARBITRARY FRAME</text>
+        <g>
+          <rect x="0" y="26" width="26" height="26" fill="#3A414F"/>
+          <text x="13" y="43" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#DCE1EA">I</text>
+          <g fill="#232833">
+            <rect x="30" y="26" width="26" height="26"/><rect x="60" y="26" width="26" height="26"/>
+            <rect x="90" y="26" width="26" height="26"/><rect x="120" y="26" width="26" height="26"/>
+            <rect x="150" y="26" width="26" height="26"/><rect x="180" y="26" width="26" height="26"/>
+            <rect x="210" y="26" width="26" height="26"/><rect x="240" y="26" width="26" height="26"/>
+            <rect x="270" y="26" width="26" height="26"/><rect x="300" y="26" width="26" height="26"/>
+            <rect x="330" y="26" width="26" height="26"/>
+          </g>
+          <rect x="360" y="26" width="26" height="26" fill="#FF5FA5"/>
+          <path d="M0 60 H386" stroke="#F2705F" stroke-width="1"/>
+          <path d="M0 56 V64 M386 56 V64" stroke="#F2705F" stroke-width="1"/>
+          <text x="193" y="79" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#F2705F">decode all of this to show one frame</text>
+        </g>
+        <text x="410" y="43" font-family="ui-monospace,monospace" font-size="11" fill="#8A93A3">the frame you asked for</text>
+        <path d="M404 39 L392 39" stroke="#8A93A3" stroke-width="1"/>
+
+        <path d="M0 108 H700" stroke="#262C39"/>
+
+        <text x="0" y="134" font-family="ui-monospace,monospace" font-size="11" letter-spacing="0.4" fill="#8A93A3">KITE PLAYBACK FILE — EVERY FRAME STANDS ALONE</text>
+        <g>
+          <g fill="#2E3644">
+            <rect x="0" y="147" width="26" height="26"/><rect x="30" y="147" width="26" height="26"/>
+            <rect x="60" y="147" width="26" height="26"/><rect x="90" y="147" width="26" height="26"/>
+            <rect x="120" y="147" width="26" height="26"/><rect x="150" y="147" width="26" height="26"/>
+            <rect x="180" y="147" width="26" height="26"/><rect x="210" y="147" width="26" height="26"/>
+            <rect x="240" y="147" width="26" height="26"/><rect x="270" y="147" width="26" height="26"/>
+            <rect x="300" y="147" width="26" height="26"/><rect x="330" y="147" width="26" height="26"/>
+          </g>
+          <rect x="360" y="147" width="26" height="26" fill="#FF5FA5"/>
+          <rect x="358" y="145" width="30" height="30" fill="none" stroke="#4ACADA" stroke-width="1.5"/>
+          <path d="M373 186 V178" stroke="#4ACADA" stroke-width="1"/>
+          <text x="373" y="199" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#4ACADA">one lookup, one decode</text>
+        </g>
+        <text x="410" y="164" font-family="ui-monospace,monospace" font-size="12.5" font-weight="600" fill="#4FC98A">1.3 ms, any frame</text>
+      </svg>
+      <figcaption>Measured on a standard Windows CI machine at 960×540 playback resolution. The
+      same check runs on every build, so this number cannot quietly regress.</figcaption>
+    </figure>
+
+    <h3>Three other things that keep it responsive</h3>
+    <div class="grid two">
+      <div class="cell">
+        <span class="tag">Threading</span>
+        <h3>Nothing heavy on the interface</h3>
+        <p>Decoding, importing and exporting all run on background threads. The window shows the
+        newest frame it already has rather than freezing until the right one arrives.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Drawing</span>
+        <h3>Only what you can see</h3>
+        <p>Clips, waveforms and thumbnails outside the visible part of the timeline are never
+        touched, so scrolling stays flat regardless of sequence length.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Audio</span>
+        <h3>Sound is the clock</h3>
+        <p>Playback is driven by the audio output, which never blocks or allocates. If the picture
+        cannot keep up, sound stays continuous instead of glitching.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">Editing</span>
+        <h3>Undo is instant</h3>
+        <p>The whole project is snapshotted on each edit in about a fifth of a millisecond, so
+        undo and redo never stall, even on a very long sequence.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <h2><span class="n">03</span> Cutting your first video</h2>
+    <ol class="steps">
+      <li><p><strong>Drag your footage onto the window.</strong> Kite prepares each file in the
+      background — you can start working before it finishes.</p></li>
+      <li><p><strong>Double-click a clip</strong> in the media list to put it on the timeline.</p></li>
+      <li><p><strong>Press <kbd>S</kbd> to cut</strong> at the playhead. Select a bad take and press
+      <kbd>Shift</kbd>+<kbd>Del</kbd> to remove it and close the gap.</p></li>
+      <li><p><strong>Drag a clip's edge</strong> to trim it, or its middle to move it — including
+      onto another track for b-roll.</p></li>
+      <li><p><strong>Add a title</strong> with the <kbd>T</kbd> button, then edit the wording,
+      size, colour and position in the inspector.</p></li>
+      <li><p><strong>Press <kbd>Ctrl</kbd>+<kbd>E</kbd> to export.</strong> Kite uses your
+      graphics card's encoder if it has one.</p></li>
+    </ol>
+
+    <h3>Keys worth knowing</h3>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Key</th><th>Does</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Space</td><td>Play / pause</td></tr>
+          <tr><td class="k">← →</td><td>Step one frame — hold Shift for a second</td></tr>
+          <tr><td class="k">S</td><td>Split at the playhead</td></tr>
+          <tr><td class="k">Shift + Del</td><td>Ripple delete — remove and close the gap</td></tr>
+          <tr><td class="k">Ctrl + D</td><td>Duplicate the selection</td></tr>
+          <tr><td class="k">, and .</td><td>Nudge the selection by a frame</td></tr>
+          <tr><td class="k">M</td><td>Snapping on / off</td></tr>
+          <tr><td class="k">Ctrl + scroll</td><td>Zoom the timeline around the pointer</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="scope">
+  <div class="wrap">
+    <h2><span class="n">04</span> What it does, and what it doesn't</h2>
+    <div class="prose">
+      <p>This is a first beta and it is deliberately narrow. It does the cutting work well and
+      leaves the rest for later, rather than doing everything badly.</p>
+    </div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Area</th><th>In this build</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Timeline</td><td class="y">Multi-track video and audio, trim, ripple delete, split, drag between tracks, snapping, duplicate, nudge</td></tr>
+          <tr><td class="k">Picture</td><td class="y">Opacity, scale, position, fades, titles with colour and alignment</td></tr>
+          <tr><td class="k">Audio</td><td class="y">Per-clip volume in dB, fades, waveforms, level meters</td></tr>
+          <tr><td class="k">Project</td><td class="y">Undo/redo, save and reopen, automatic playback-file cache</td></tr>
+          <tr><td class="k">Export</td><td class="y">H.264 MP4 from your original media, hardware encoding when available</td></tr>
+          <tr><td class="k">Colour</td><td class="n">Not yet — no grading, curves or scopes</td></tr>
+          <tr><td class="k">Effects</td><td class="n">Not yet — no transitions beyond fades, no keyframes, no speed changes</td></tr>
+          <tr><td class="k">Other</td><td class="n">Windows only for now. No 3D, no motion graphics</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <p><strong>It is a beta, and it is honest about that.</strong> The media pipeline — import,
+      decoding, titles, export — is checked automatically on every single build, including an
+      export of a 120-cut timeline. The interface itself has had far less real-world use, so if
+      something is going to be rough, that is where it will be.</p>
+      <p>Found something broken? <a href="https://github.com/__REPO__/issues/new/choose">Open an issue</a> —
+      that is exactly what this beta is for.</p>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <h2><span class="n">05</span> Download</h2>
+    <div class="dl">
+      <div class="dl-main">
+        <a class="btn" href="https://github.com/__REPO__/releases/latest">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1v8.6l3.3-3.3 1 1L8 12 3.7 7.3l1-1L8 9.6V1zM2 13h12v1.5H2z"/></svg>
+          Get the installer
+        </a>
+        <p class="cta-note">Run <code>KiteSetup-*.exe</code>. It installs in a couple of seconds.</p>
+
+        <div class="note accent" style="margin-top:22px">
+          <p><strong>Windows will warn you the first time.</strong> The installer is not code-signed
+          yet, so SmartScreen shows “Windows protected your PC”. Click <em>More info</em> →
+          <em>Run anyway</em>. You can read every line of the source and check exactly how the
+          installer was built on the Actions tab.</p>
+        </div>
+      </div>
+
+      <div class="dl-meta">
+        <div><span>Platform</span><span>Windows 10/11 · x64</span></div>
+        <div><span>Size</span><span>~86 MB</span></div>
+        <div><span>Price</span><span>Free</span></div>
+        <div><span>Account</span><span>Not required</span></div>
+        <div><span>Network use</span><span>None</span></div>
+        <div><span>Bundled</span><span>ffmpeg</span></div>
+        <div><span>Source</span><span><a href="https://github.com/__REPO__">on GitHub</a></span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <h2><span class="n">06</span> Building it yourself</h2>
+    <div class="prose">
+      <p>Kite is written in Rust and draws its own interface on the GPU — there is no browser
+      inside it, which is part of why it starts quickly and stays small.</p>
+      <p>With a Rust toolchain and <code>ffmpeg</code> available, <code>cargo build --release</code>
+      is the whole thing. <code>kite --selftest</code> runs the full pipeline check against a
+      synthesised clip and prints the timings you see on this page.</p>
+      <p><a href="https://github.com/__REPO__">Read the source and the architecture notes →</a></p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Kite · a fast video editor for ordinary hardware</p>
+    <p><a href="https://github.com/__REPO__">Source</a> ·
+       <a href="https://github.com/__REPO__/releases">Releases</a> ·
+       <a href="https://github.com/__REPO__/issues">Issues</a></p>
+    <p style="margin-top:14px; max-width:70ch">Bundles FFmpeg, which is licensed separately — see
+       THIRD-PARTY.md in the repository.</p>
+  </div>
+</footer>
+
+</body>
+</html>
