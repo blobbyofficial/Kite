@@ -37,16 +37,28 @@ A video editor built around one idea: it should stay responsive on a modest lapt
 
 ## What's in this beta
 
-Multi-track video and audio, trimming and ripple editing, drag between tracks, snapping,
-per-clip volume with fades, opacity, scale and position, titles with colour and alignment,
-waveforms, audio metering, undo/redo, project save/load, and H.264 export with hardware
-encoders when your machine has them.
+Multi-track video and audio, trimming and ripple editing, drag between tracks (single or
+multiple clips at once), snapping, rubber-band selection, copy and paste, duplicate and nudge.
+Per-clip volume with fades, opacity, scale and position, crossfades between clips, speed from
+0.25× to 4× with the audio retimed, and brightness/contrast/saturation with one-click looks.
+Titles, waveforms and thumbnails on the timeline, audio metering, undo/redo, autosave with
+crash recovery, project save/load, and H.264 export with hardware encoders when available.
 
 ## What isn't, yet
 
-Colour grading, effects and transitions beyond fades, keyframes, speed changes, transitions
-between clips, clip thumbnails on the timeline, and multi-clip drag. These are the next things
-in line — the engine underneath them is already in place.
+Colour wheels, curves and scopes; keyframes; transitions other than crossfade. These are next —
+the engine underneath them is already in place.
+
+## Extra keys
+
+| Key | Does |
+|---|---|
+| `Ctrl+T` | Crossfade into the selected clip from the one before |
+| `Ctrl+C` / `Ctrl+V` | Copy and paste at the playhead |
+| `Ctrl+D` | Duplicate the selection |
+| `,` / `.` | Nudge by a frame (Shift for a second) |
+| Drag empty space | Rubber-band select |
+| `Shift`+scroll | Scroll tracks vertically |
 
 ## If something goes wrong
 

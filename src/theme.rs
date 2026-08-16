@@ -6,6 +6,7 @@ use egui::{Color32, CornerRadius, Stroke, Visuals};
 pub const BG: Color32 = Color32::from_rgb(0x11, 0x13, 0x18);
 pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x1A, 0x21);
 pub const PANEL_HI: Color32 = Color32::from_rgb(0x1E, 0x22, 0x2B);
+pub const LINE_2_OR_DIM: Color32 = Color32::from_rgb(0x39, 0x41, 0x4F);
 pub const LINE: Color32 = Color32::from_rgb(0x2A, 0x2F, 0x3A);
 pub const TEXT: Color32 = Color32::from_rgb(0xD8, 0xDD, 0xE6);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8A, 0x93, 0xA3);

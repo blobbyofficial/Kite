@@ -17,6 +17,11 @@ winresource = "0.1"
 [dependencies]
 eframe = { version = "0.33", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 egui = "0.33"
+# eframe with default-features off leaves wgpu with no graphics backend compiled in at all, and
+# the application then aborts on startup with "No wgpu backend feature ... was enabled". Naming
+# wgpu directly turns the backends on through feature unification. gles is the fallback for
+# machines whose Vulkan or D3D12 drivers are broken or absent, which is squarely our target.
+wgpu = { version = "27", default-features = false, features = ["vulkan", "dx12", "gles", "metal"] }
 rfd = "0.15"
 cpal = "0.16"
 zune-jpeg = "0.5"

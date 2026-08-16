@@ -16,8 +16,8 @@ const EDGE_GRAB: f32 = 7.0;
 pub fn panel(app: &mut App, ctx: &Context) {
     egui::TopBottomPanel::bottom("timeline")
         .resizable(true)
-        .default_height(300.0)
-        .min_height(160.0)
+        .default_height(320.0)
+        .height_range(180.0..=900.0)
         .frame(egui::Frame::NONE.fill(theme::PANEL))
         .show(ctx, |ui| {
             toolbar(app, ui);
@@ -25,6 +25,10 @@ pub fn panel(app: &mut App, ctx: &Context) {
             let rect = ui.available_rect_before_wrap();
             if rect.height() > 30.0 {
                 body(app, ui, rect);
+                // The panel remembers its content height between frames, and everything below is
+                // painted rather than laid out. Without claiming the space the panel would shrink
+                // to the height of the toolbar and stay there.
+                ui.allocate_rect(rect, Sense::hover());
             }
         });
 }
@@ -49,6 +53,14 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("T Text").on_hover_text("Add a title at the playhead").clicked() {
             app.add_text_clip();
         }
+        if ui
+            .button("⧗ Crossfade")
+            .on_hover_text("Dissolve the selected clip from the one before it (Ctrl+T)")
+            .clicked()
+        {
+            let half = (app.fps() as i64 / 2).max(1);
+            app.crossfade_selected(half);
+        }
         ui.separator();
         ui.checkbox(&mut app.snap, "Snap").on_hover_text("Toggle with M");
         ui.checkbox(&mut app.follow, "Follow");
@@ -59,8 +71,8 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("+").on_hover_text("Zoom in (+)").clicked() {
             app.px_per_frame = (app.px_per_frame * 1.35).min(80.0);
         }
-        if ui.button("Fit").clicked() {
-            fit_to_window(app, ui.available_width().max(200.0));
+        if ui.button("Fit").on_hover_text("Zoom so the whole sequence is visible").clicked() {
+            fit_to_window(app);
         }
         ui.separator();
         if ui.button("+ Video track").clicked() {
@@ -74,9 +86,11 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn fit_to_window(app: &mut App, width: f32) {
+fn fit_to_window(app: &mut App) {
     let d = app.duration().max(1) as f32;
-    app.px_per_frame = ((width - HEADER_W - 24.0) / d).clamp(0.02, 80.0);
+    // Uses the measured lane width; asking the toolbar for its remaining width gave a fraction of
+    // the timeline and zoomed far too far out.
+    app.px_per_frame = ((app.lane_width - 16.0) / d).clamp(0.02, 80.0);
     app.scroll_x = 0.0;
 }
 
@@ -177,11 +191,15 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
                     app.px_per_frame = (app.px_per_frame * factor).clamp(0.02, 80.0);
                     let new_x = x_of(app, lane_rect, f_at);
                     app.scroll_x += new_x - anchor.x;
+                } else if i.modifiers.shift {
+                    app.scroll_y -= i.raw_scroll_delta.y;
                 } else {
-                    let dx = if i.modifiers.shift {
-                        i.raw_scroll_delta.y
-                    } else {
+                    // Trackpads report horizontal directly; a wheel only has a vertical axis, and
+                    // in a timeline that should move you along the sequence.
+                    let dx = if i.raw_scroll_delta.x.abs() > 0.01 {
                         i.raw_scroll_delta.x
+                    } else {
+                        i.raw_scroll_delta.y
                     };
                     app.scroll_x -= dx;
                 }
@@ -191,6 +209,10 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
 
     let max_scroll = (app.duration() as f32 * app.px_per_frame - lane_rect.width() + 200.0).max(0.0);
     app.scroll_x = app.scroll_x.clamp(0.0, max_scroll);
+
+    let content_h: f32 = app.project.tracks.iter().map(|t| t.height).sum();
+    let max_scroll_y = (content_h - tracks_rect.height()).max(0.0);
+    app.scroll_y = app.scroll_y.clamp(0.0, max_scroll_y);
 
     if app.follow && app.playing {
         let x = x_of(app, lane_rect, app.playhead);
@@ -202,6 +224,8 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
 
     ensure_thumbs(app, ui.ctx(), lane_rect, tracks_rect);
 
+    app.lane_width = lane_rect.width();
+
     let painter = ui.painter_at(rect);
     painter.rect_filled(head_rect, CornerRadius::ZERO, theme::PANEL_HI);
     painter.rect_filled(lane_rect, CornerRadius::ZERO, theme::BG);
@@ -209,7 +233,7 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
     draw_ruler(app, ui, &painter, ruler_rect);
 
     // ---- tracks ------------------------------------------------------------
-    let mut y = tracks_rect.top() - 0.0;
+    let mut y = tracks_rect.top() - app.scroll_y;
     let track_ids: Vec<(TrackId, f32)> = app
         .project
         .tracks
@@ -228,15 +252,32 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
         if y > tracks_rect.bottom() {
             break;
         }
-        draw_track_header(app, ui, *tid, h_rect);
-        let hit = draw_track(app, ui, &painter, *tid, t_rect);
-        if hovered_clip.is_none() {
-            hovered_clip = hit;
+        if y + th >= tracks_rect.top() {
+            draw_track_header(app, ui, *tid, h_rect);
+            let hit = draw_track(app, ui, &painter, *tid, t_rect);
+            if hovered_clip.is_none() {
+                hovered_clip = hit;
+            }
         }
         y += th;
         painter.line_segment(
             [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
             Stroke::new(1.0, theme::LINE),
+        );
+    }
+
+    if max_scroll_y > 0.0 {
+        let frac = (tracks_rect.height() / content_h).clamp(0.05, 1.0);
+        let bar_h = tracks_rect.height() * frac;
+        let t = app.scroll_y / max_scroll_y;
+        let top = tracks_rect.top() + (tracks_rect.height() - bar_h) * t;
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(rect.right() - 5.0, top),
+                Vec2::new(3.0, bar_h),
+            ),
+            CornerRadius::same(2),
+            theme::LINE_2_OR_DIM,
         );
     }
 
@@ -481,6 +522,24 @@ fn draw_track(
             }
         }
 
+        // A crossfade is drawn as the two clips overlapping in the dissolve window.
+        if c.transition_in > 0 {
+            let tx = x_of(app, r, c.start + c.transition_in).min(cr.right());
+            let band = Rect::from_min_max(Pos2::new(cr.left(), cr.top()), Pos2::new(tx, cr.bottom()));
+            if band.width() > 1.0 {
+                let p = painter.with_clip_rect(cr);
+                p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(90));
+                p.line_segment(
+                    [band.left_bottom(), band.right_top()],
+                    Stroke::new(1.0, Color32::from_white_alpha(120)),
+                );
+                p.line_segment(
+                    [band.left_top(), band.right_bottom()],
+                    Stroke::new(1.0, Color32::from_white_alpha(120)),
+                );
+            }
+        }
+
         if c.fade_in > 0 {
             let fx = x_of(app, r, c.start + c.fade_in);
             painter.add(egui::Shape::convex_polygon(
@@ -663,8 +722,53 @@ fn handle_interaction(
                     others,
                 });
             }
-        } else if pointer.map(|p| tracks_rect.contains(p)).unwrap_or(false) {
-            app.project.clear_selection();
+        } else if let Some(p) = pointer.filter(|p| tracks_rect.contains(*p)) {
+            // Dragging empty space selects a region rather than moving the playhead.
+            app.marquee = Some((p, p));
+            if !ui.ctx().input(|i| i.modifiers.shift) {
+                app.project.clear_selection();
+            }
+        }
+    }
+
+    // --- rubber-band selection ----------------------------------------------
+    if resp.dragged() {
+        if let (Some((anchor, _)), Some(p)) = (app.marquee, pointer) {
+            app.marquee = Some((anchor, p));
+            let sel = Rect::from_two_pos(anchor, p);
+            let f0 = frame_at(app, lane, sel.left());
+            let f1 = frame_at(app, lane, sel.right());
+            let additive = ui.ctx().input(|i| i.modifiers.shift);
+
+            let mut top = tracks_rect.top() - app.scroll_y;
+            let mut hits: Vec<ClipId> = Vec::new();
+            for t in &app.project.tracks {
+                let bottom = top + t.height;
+                if bottom > sel.top() && top < sel.bottom() && !t.locked {
+                    for c in &t.clips {
+                        if c.start < f1 && c.end() > f0 {
+                            hits.push(c.id);
+                        }
+                    }
+                }
+                top = bottom;
+            }
+            for t in &mut app.project.tracks {
+                for c in &mut t.clips {
+                    if hits.contains(&c.id) {
+                        c.selected = true;
+                    } else if !additive {
+                        c.selected = false;
+                    }
+                }
+            }
+            ui.painter().rect_filled(sel, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.18));
+            ui.painter().rect_stroke(
+                sel,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, theme::ACCENT),
+                StrokeKind::Inside,
+            );
         }
     }
 
@@ -745,14 +849,19 @@ fn handle_interaction(
                 DragKind::TrimStart => {
                     let want = app.snap_target(raw, Some(cid));
                     let max_start = orig_start + orig_len - 1;
+                    let speed = app
+                        .project
+                        .clip(cid)
+                        .map(|(_, c)| c.speed.max(0.01) as f64)
+                        .unwrap_or(1.0);
                     // Cannot trim earlier than the source has material for.
-                    let min_start = orig_start - orig_src_in;
+                    let min_start = orig_start - (orig_src_in as f64 / speed).floor() as i64;
                     let new_start = want.clamp(min_start.max(0), max_start);
                     let delta = new_start - orig_start;
                     if let Some(c) = app.project.clip_mut(cid) {
                         c.start = new_start;
                         c.len = orig_len - delta;
-                        c.src_in = orig_src_in + delta;
+                        c.src_in = orig_src_in + (delta as f64 * speed).round() as i64;
                     }
                     if let Some(s) = app.drag.as_mut() {
                         s.moved = true;
@@ -766,7 +875,13 @@ fn handle_interaction(
                         .and_then(|(_, c)| c.media_id())
                         .and_then(|m| app.project.media(m).map(|m| m.frames))
                         .unwrap_or(i64::MAX / 4);
-                    let max_end = orig_start - orig_src_in + media_len;
+                    let speed = app
+                        .project
+                        .clip(cid)
+                        .map(|(_, c)| c.speed.max(0.01) as f64)
+                        .unwrap_or(1.0);
+                    let usable = ((media_len - orig_src_in).max(0) as f64 / speed).floor() as i64;
+                    let max_end = orig_start + usable;
                     let new_end = want.clamp(orig_start + 1, max_end.max(orig_start + 1));
                     if let Some(c) = app.project.clip_mut(cid) {
                         c.len = new_end - orig_start;
@@ -781,6 +896,7 @@ fn handle_interaction(
 
     // --- finish -------------------------------------------------------------
     if resp.drag_stopped() {
+        app.marquee = None;
         if app.drag.take().is_some() {
             app.project.normalize();
             app.mark_audio_dirty();
@@ -815,7 +931,7 @@ fn handle_interaction(
 }
 
 fn track_at_y(app: &App, tracks_rect: Rect, y: f32) -> Option<TrackId> {
-    let mut top = tracks_rect.top();
+    let mut top = tracks_rect.top() - app.scroll_y;
     for t in &app.project.tracks {
         if y >= top && y < top + t.height {
             return Some(t.id);

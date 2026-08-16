@@ -3,6 +3,7 @@
 use crate::app::{App, PROXY_HEIGHTS};
 use crate::export::Quality;
 use crate::project::{timecode, ClipSource, ImportState, MediaId, TextAlign, TrackKind};
+use crate::project::ColorAdjust;
 use crate::theme;
 use egui::{Align, Align2, Color32, Context, CornerRadius, Layout, Pos2, Rect, Sense, Vec2};
 
@@ -311,6 +312,8 @@ pub fn inspector(app: &mut App, ctx: &Context) {
             let fps = app.project.settings.fps;
             let mut c = clip.clone();
             let mut changed = false;
+            let mut speed_change: Option<f32> = None;
+            let mut crossfade: Option<i64> = None;
 
             let title = match &c.source {
                 ClipSource::Media(m) => app.project.media(*m).map(|m| m.name.clone()).unwrap_or_default(),
@@ -387,6 +390,71 @@ pub fn inspector(app: &mut App, ctx: &Context) {
                     ui.separator();
                 }
 
+                if kind == TrackKind::Video {
+                    ui.label("Colour");
+                    changed |= ui
+                        .add(egui::Slider::new(&mut c.color.brightness, -0.5..=0.5).text("Brightness"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(&mut c.color.contrast, 0.0..=2.5).text("Contrast"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(&mut c.color.saturation, 0.0..=2.5).text("Saturation"))
+                        .changed();
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Punchy").clicked() {
+                            c.color = ColorAdjust { brightness: 0.02, contrast: 1.15, saturation: 1.18 };
+                            changed = true;
+                        }
+                        if ui.small_button("Flat").clicked() {
+                            c.color = ColorAdjust { brightness: 0.0, contrast: 0.88, saturation: 0.9 };
+                            changed = true;
+                        }
+                        if ui.small_button("Mono").clicked() {
+                            c.color = ColorAdjust { brightness: 0.0, contrast: 1.05, saturation: 0.0 };
+                            changed = true;
+                        }
+                        if ui.small_button("Reset").clicked() {
+                            c.color = ColorAdjust::default();
+                            changed = true;
+                        }
+                    });
+                    ui.separator();
+                }
+
+                ui.label("Speed");
+                let mut speed = c.speed;
+                let speed_resp = ui.add(
+                    egui::Slider::new(&mut speed, 0.25..=4.0)
+                        .logarithmic(true)
+                        .text("×"),
+                );
+                ui.horizontal(|ui| {
+                    for (label, v) in [("0.5×", 0.5f32), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)] {
+                        if ui.small_button(label).clicked() {
+                            speed = v;
+                        }
+                    }
+                });
+                if speed_resp.changed() || (speed - c.speed).abs() > 1e-4 {
+                    speed_change = Some(speed);
+                }
+                ui.separator();
+
+                ui.label("Crossfade from previous clip");
+                let mut tr = c.transition_in;
+                if ui
+                    .add(egui::Slider::new(&mut tr, 0..=(c.len.min(fps as i64 * 3)).max(1)).text("Frames"))
+                    .changed()
+                {
+                    c.transition_in = tr;
+                    changed = true;
+                }
+                if ui.button("Add ½ second dissolve").clicked() {
+                    crossfade = Some((fps as i64 / 2).max(1));
+                }
+                ui.separator();
+
                 ui.label("Fades");
                 let max_fade = (c.len / 2).max(1);
                 let mut fi = c.fade_in;
@@ -418,6 +486,12 @@ pub fn inspector(app: &mut App, ctx: &Context) {
 
             if changed {
                 app.apply_clip_edit(cid, c);
+            }
+            if let Some(sp) = speed_change {
+                app.set_clip_speed(cid, sp);
+            }
+            if let Some(fr) = crossfade {
+                app.crossfade_selected(fr);
             }
         });
 }
@@ -523,9 +597,33 @@ pub fn status_bar(app: &mut App, ctx: &Context, frame_ms: f32) {
 }
 
 pub fn overlays(app: &mut App, ctx: &Context) {
+    recovery_prompt(app, ctx);
     export_dialog(app, ctx);
     export_progress(app, ctx);
     shortcuts_window(app, ctx);
+}
+
+fn recovery_prompt(app: &mut App, ctx: &Context) {
+    if app.recovery.is_none() {
+        return;
+    }
+    egui::Window::new("Recover unsaved work")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            ui.label("Kite found a project from a session that ended without saving.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Recover it").min_size(Vec2::new(110.0, 26.0))).clicked() {
+                    app.recover();
+                }
+                if ui.button("Start fresh").clicked() {
+                    app.discard_recovery();
+                }
+            });
+        });
 }
 
 fn export_dialog(app: &mut App, ctx: &Context) {
@@ -651,7 +749,11 @@ fn shortcuts_window(app: &mut App, ctx: &Context) {
                 ("S  or  Ctrl+K", "Split at playhead"),
                 ("Del", "Delete selected clip"),
                 ("Shift + Del", "Ripple delete (close the gap)"),
+                ("Ctrl+C / Ctrl+V", "Copy and paste clips at the playhead"),
+                ("Ctrl+T", "Crossfade into the selected clip"),
                 ("Ctrl+D", "Duplicate selected clips"),
+                ("Drag empty space", "Rubber-band select"),
+                ("Shift + scroll", "Scroll tracks vertically"),
                 (", / .", "Nudge selection by a frame (Shift: a second)"),
                 ("M", "Toggle snapping"),
                 ("+ / −", "Zoom timeline"),

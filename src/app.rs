@@ -6,8 +6,8 @@ use crate::export::{self, Encoder, ExportJob, ExportMsg, ExportSettings, Quality
 use crate::ffmpeg::Tools;
 use crate::import::{ImportMsg, Importer};
 use crate::project::{
-    timecode, Clip, ClipId, ClipSource, History, ImportState, MediaId, MediaItem, Project,
-    TextProps, Track, TrackId, TrackKind, VideoSettings,
+    timecode, Clip, ClipId, ClipSource, ColorAdjust, History, ImportState, MediaId, MediaItem,
+    Project, TextProps, Track, TrackId, TrackKind, VideoSettings,
 };
 use crate::theme;
 use egui::{Align2, Color32, Context, CornerRadius, Rect, Stroke, StrokeKind, Vec2};
@@ -25,6 +25,13 @@ pub enum DragKind {
     Move,
     TrimStart,
     TrimEnd,
+}
+
+/// A preview texture plus a fingerprint of what is currently in it, so an idle window re-uploads
+/// nothing at all.
+struct TexSlot {
+    handle: egui::TextureHandle,
+    key: u64,
 }
 
 pub struct DragState {
@@ -59,6 +66,10 @@ pub struct App {
 
     pub px_per_frame: f32,
     pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub marquee: Option<(egui::Pos2, egui::Pos2)>,
+    /// Width of the timeline lane as last drawn, so "Fit" has a real number to work from.
+    pub lane_width: f32,
     pub snap: bool,
     pub follow: bool,
     pub proxy_height: u32,
@@ -66,7 +77,9 @@ pub struct App {
     pub drag: Option<DragState>,
     pub scrubbing: bool,
 
-    tex: Vec<egui::TextureHandle>,
+    tex: Vec<TexSlot>,
+    /// Scratch buffer for colour correction, reused across frames.
+    adjust_buf: Vec<u8>,
     thumbs: HashMap<(MediaId, u32), egui::TextureHandle>,
     thumb_order: Vec<(MediaId, u32)>,
     pcm: HashMap<MediaId, Arc<Mmap>>,
@@ -83,6 +96,10 @@ pub struct App {
     pub show_shortcuts: bool,
     pub toast: Option<(String, Instant, bool)>,
     pub selected_media: Option<MediaId>,
+    clipboard: Vec<(usize, Clip)>,
+    last_autosave: Instant,
+    /// Set at startup when an autosave from a previous session is newer than anything saved.
+    pub recovery: Option<PathBuf>,
     last_edit: Option<ClipId>,
     last_edit_at: Option<Instant>,
     /// Rolling average of frame times, shown in the status bar.
@@ -132,12 +149,16 @@ impl App {
             clock: None,
             px_per_frame: 4.0,
             scroll_x: 0.0,
+            scroll_y: 0.0,
+            marquee: None,
+            lane_width: 800.0,
             snap: true,
             follow: true,
             proxy_height: 540,
             drag: None,
             scrubbing: false,
             tex: Vec::new(),
+            adjust_buf: Vec::new(),
             thumbs: HashMap::new(),
             thumb_order: Vec::new(),
             pcm: HashMap::new(),
@@ -152,12 +173,21 @@ impl App {
             show_shortcuts: false,
             toast: None,
             selected_media: None,
+            clipboard: Vec::new(),
+            last_autosave: Instant::now(),
+            recovery: None,
             last_edit: None,
             last_edit_at: None,
             frame_ms: 0.0,
         };
         if let Some(p) = open_path {
             me.open_path(p);
+        } else {
+            // A leftover autosave means the last session ended without saving.
+            let a = autosave_path();
+            if a.is_file() {
+                me.recovery = Some(a);
+            }
         }
         me
     }
@@ -655,6 +685,173 @@ impl App {
         }
     }
 
+    /// Cross-dissolve each selected clip with the one before it on the same track.
+    ///
+    /// The dissolve needs material past the earlier clip's out point to fade from, so the length
+    /// is clamped to whatever handles that clip actually has.
+    pub fn crossfade_selected(&mut self, frames: i64) {
+        let sel = self.project.selected_ids();
+        if sel.is_empty() {
+            self.warn("Select the clip you want to fade into");
+            return;
+        }
+        let mut applied = 0;
+        let mut short = 0;
+        let mut plan: Vec<(ClipId, i64)> = Vec::new();
+
+        for track in &self.project.tracks {
+            for c in track.clips.iter().filter(|c| sel.contains(&c.id)) {
+                let Some(prev) = track.prev_clip(c.id) else { continue };
+                if prev.end() != c.start {
+                    continue; // only clips that actually butt up against each other
+                }
+                let handles = match prev.media_id().and_then(|m| self.project.media(m)) {
+                    Some(m) => (m.frames - (prev.src_in + prev.source_span())).max(0),
+                    // Titles and colour cards can be extended freely.
+                    None => frames,
+                };
+                let max = frames.min(handles).min(prev.len).min(c.len);
+                if max <= 0 {
+                    short += 1;
+                    continue;
+                }
+                if max < frames {
+                    short += 1;
+                }
+                plan.push((c.id, max));
+            }
+        }
+
+        if plan.is_empty() {
+            self.warn("Nothing to fade into — a crossfade needs two clips that touch");
+            return;
+        }
+        self.snapshot();
+        for (id, len) in plan {
+            if let Some(c) = self.project.clip_mut(id) {
+                c.transition_in = len;
+            }
+            applied += 1;
+        }
+        if short > 0 {
+            self.notify(format!(
+                "Added {applied} crossfade(s) — {short} shortened to fit the footage available"
+            ));
+        } else {
+            self.notify(format!("Added {applied} crossfade(s)"));
+        }
+    }
+
+    /// Changing speed keeps the same stretch of source material and changes how long the clip
+    /// occupies the timeline, which is what an editor expects.
+    pub fn set_clip_speed(&mut self, cid: ClipId, speed: f32) {
+        let speed = speed.clamp(0.1, 8.0);
+        let Some((_, c)) = self.project.clip(cid) else { return };
+        if (c.speed - speed).abs() < 1e-4 {
+            return;
+        }
+        let span = c.source_span();
+        let new_len = ((span as f64) / speed as f64).round().max(1.0) as i64;
+        let coalesce = self.last_edit == Some(cid)
+            && self.last_edit_at.map(|t| t.elapsed().as_millis() < 700).unwrap_or(false);
+        if !coalesce {
+            self.history.push(&self.project);
+        }
+        self.last_edit = Some(cid);
+        self.last_edit_at = Some(Instant::now());
+        self.dirty = true;
+        self.audio_dirty = true;
+        if let Some(c) = self.project.clip_mut(cid) {
+            c.speed = speed;
+            c.len = new_len;
+        }
+        self.project.normalize();
+    }
+
+    pub fn copy_selected(&mut self) {
+        let mut out = Vec::new();
+        for (ti, track) in self.project.tracks.iter().enumerate() {
+            for c in track.clips.iter().filter(|c| c.selected) {
+                out.push((ti, c.clone()));
+            }
+        }
+        if out.is_empty() {
+            return;
+        }
+        let n = out.len();
+        self.clipboard = out;
+        self.notify(format!("Copied {n} clip(s)"));
+    }
+
+    /// Pastes the clipboard so its earliest clip lands on the playhead, keeping relative spacing.
+    pub fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let base = self
+            .clipboard
+            .iter()
+            .map(|(_, c)| c.start)
+            .min()
+            .unwrap_or(0);
+        let shift = self.playhead - base;
+        self.snapshot();
+        let items = self.clipboard.clone();
+        let mut new_ids = Vec::new();
+        for (ti, mut c) in items {
+            let Some(&tid) = self.project.tracks.get(ti).map(|t| &t.id) else { continue };
+            if self.project.track(tid).map(|t| t.locked).unwrap_or(true) {
+                continue;
+            }
+            c.id = self.project.alloc_id();
+            c.start = (c.start + shift).max(0);
+            c.selected = true;
+            c.transition_in = 0;
+            new_ids.push(c.id);
+            if let Some(t) = self.project.track_mut(tid) {
+                t.clips.push(c);
+            }
+        }
+        self.project.clear_selection();
+        for id in &new_ids {
+            if let Some(c) = self.project.clip_mut(*id) {
+                c.selected = true;
+            }
+        }
+        self.project.normalize();
+        self.notify(format!("Pasted {} clip(s)", new_ids.len()));
+    }
+
+    /// Writes a recovery copy periodically so a crash costs seconds, not the session.
+    fn autosave(&mut self) {
+        if !self.dirty || self.last_autosave.elapsed().as_secs() < 20 {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        if let Some(p) = &self.project_path {
+            let p = p.clone();
+            if self.project.save(&p).is_ok() {
+                self.dirty = false;
+                self.notify("Saved");
+                return;
+            }
+        }
+        self.project.save(&autosave_path()).ok();
+    }
+
+    pub fn recover(&mut self) {
+        if let Some(p) = self.recovery.take() {
+            self.open_path(p);
+            self.project_path = None;
+            self.dirty = true;
+        }
+    }
+    pub fn discard_recovery(&mut self) {
+        if let Some(p) = self.recovery.take() {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
     pub fn select_all(&mut self) {
         for t in &mut self.project.tracks {
             for c in &mut t.clips {
@@ -883,6 +1080,7 @@ impl App {
                 }
                 self.project_path = Some(path);
                 self.dirty = false;
+                std::fs::remove_file(autosave_path()).ok();
                 self.notify("Project saved");
             }
             Err(e) => self.warn(format!("Could not save: {e}")),
@@ -1070,6 +1268,16 @@ impl App {
         if mods.command && pressed(Key::D) {
             self.duplicate_selected();
         }
+        if mods.command && pressed(Key::C) {
+            self.copy_selected();
+        }
+        if mods.command && pressed(Key::V) {
+            self.paste();
+        }
+        if mods.command && pressed(Key::T) {
+            let half = (self.fps() as i64 / 2).max(1);
+            self.crossfade_selected(half);
+        }
         if pressed(Key::Comma) {
             self.nudge_selected(-step);
         }
@@ -1136,9 +1344,32 @@ impl App {
             scale: f32,
             px: f32,
             py: f32,
-            color: Option<[u8; 4]>,
+            color: ColorAdjust,
+            solid: Option<[u8; 4]>,
             text: Option<TextProps>,
         }
+        impl Draw {
+            fn from_clip(c: &Clip, f: i64, alpha: f32) -> Self {
+                Self {
+                    media: c.media_id(),
+                    src: c.source_frame(f).max(0) as u32,
+                    alpha,
+                    scale: c.scale,
+                    px: c.pos_x,
+                    py: c.pos_y,
+                    color: c.color,
+                    solid: match &c.source {
+                        ClipSource::Color(v) => Some(*v),
+                        _ => None,
+                    },
+                    text: match &c.source {
+                        ClipSource::Text(t) => Some(t.clone()),
+                        _ => None,
+                    },
+                }
+            }
+        }
+
         let mut draws: Vec<Draw> = Vec::new();
         let video: Vec<&Track> = self
             .project
@@ -1147,41 +1378,19 @@ impl App {
             .filter(|t| t.kind == TrackKind::Video && !t.hidden)
             .collect();
         for track in video.iter().rev() {
-            if let Some(c) = track.clip_at(f) {
-                let a = c.alpha_at(f);
-                match &c.source {
-                    ClipSource::Media(m) => draws.push(Draw {
-                        media: Some(*m),
-                        src: c.source_frame(f).max(0) as u32,
-                        alpha: a,
-                        scale: c.scale,
-                        px: c.pos_x,
-                        py: c.pos_y,
-                        color: None,
-                        text: None,
-                    }),
-                    ClipSource::Color(rgba) => draws.push(Draw {
-                        media: None,
-                        src: 0,
-                        alpha: a,
-                        scale: 1.0,
-                        px: 0.0,
-                        py: 0.0,
-                        color: Some(*rgba),
-                        text: None,
-                    }),
-                    ClipSource::Text(t) => draws.push(Draw {
-                        media: None,
-                        src: 0,
-                        alpha: a,
-                        scale: 1.0,
-                        px: 0.0,
-                        py: 0.0,
-                        color: None,
-                        text: Some(t.clone()),
-                    }),
+            let Some(c) = track.clip_at(f) else { continue };
+
+            // Inside a crossfade the previous clip keeps running underneath, using material past
+            // its out point, and this clip fades up over it.
+            let mut alpha = c.alpha_at(f);
+            if c.transition_in > 0 && f < c.start + c.transition_in {
+                let t = ((f - c.start) as f32 + 1.0) / c.transition_in as f32;
+                if let Some(prev) = track.prev_clip(c.id) {
+                    draws.push(Draw::from_clip(prev, f, prev.alpha_at(prev.end() - 1)));
                 }
+                alpha *= t.clamp(0.0, 1.0);
             }
+            draws.push(Draw::from_clip(c, f, alpha));
         }
 
         for d in draws {
@@ -1196,7 +1405,8 @@ impl App {
                     self.cache.get(mid, d.src)
                 };
                 let Some(img) = frame else { continue };
-                let tex = self.texture_slot(ui.ctx(), layer, &img);
+                let key = (mid << 40) ^ ((d.src as u64) << 8) ^ d.color.key();
+                let tex = self.texture_slot(ui.ctx(), layer, &img, &d.color, key);
                 layer += 1;
 
                 let src_aspect = img.width as f32 / img.height.max(1) as f32;
@@ -1218,7 +1428,7 @@ impl App {
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     tint,
                 );
-            } else if let Some(c) = d.color {
+            } else if let Some(c) = d.solid {
                 let col = Color32::from_rgba_unmultiplied(
                     c[0],
                     c[1],
@@ -1274,6 +1484,30 @@ impl App {
             Stroke::new(1.0, theme::LINE),
             StrokeKind::Outside,
         );
+
+        if self.project.media.is_empty() {
+            let lines = [
+                ("Drop a video file anywhere on this window", true),
+                ("", false),
+                ("or press Ctrl+I to browse", false),
+                ("", false),
+                ("Then double-click it in the media list to put it on the timeline.", false),
+                ("Press S to cut, Shift+Del to remove a bad take, Ctrl+E to export.", false),
+            ];
+            let mut y = frame_rect.center().y - 54.0;
+            for (line, strong) in lines {
+                if !line.is_empty() {
+                    painter.text(
+                        egui::pos2(frame_rect.center().x, y),
+                        Align2::CENTER_CENTER,
+                        line,
+                        if strong { theme::ui_font(16.0) } else { theme::ui_font(12.5) },
+                        if strong { theme::TEXT } else { theme::TEXT_DIM },
+                    );
+                }
+                y += if strong { 30.0 } else { 20.0 };
+            }
+        }
     }
 
     fn texture_slot(
@@ -1281,19 +1515,54 @@ impl App {
         ctx: &Context,
         idx: usize,
         img: &crate::decode::DecodedFrame,
+        adj: &ColorAdjust,
+        key: u64,
     ) -> egui::TextureId {
+        // Nothing changed since this slot was last filled — skip the colour pass and the upload.
+        if idx < self.tex.len() && self.tex[idx].key == key {
+            return self.tex[idx].handle.id();
+        }
+
+        let pixels: &[u8] = if adj.is_neutral() {
+            &img.rgba
+        } else {
+            apply_color(&img.rgba, &mut self.adjust_buf, adj);
+            &self.adjust_buf
+        };
         let color = egui::ColorImage::from_rgba_unmultiplied(
             [img.width as usize, img.height as usize],
-            &img.rgba,
+            pixels,
         );
         let opts = egui::TextureOptions::LINEAR;
         if idx < self.tex.len() {
-            self.tex[idx].set(color, opts);
+            self.tex[idx].handle.set(color, opts);
+            self.tex[idx].key = key;
         } else {
-            let h = ctx.load_texture(format!("preview{idx}"), color, opts);
-            self.tex.push(h);
+            let handle = ctx.load_texture(format!("preview{idx}"), color, opts);
+            self.tex.push(TexSlot { handle, key });
         }
-        self.tex[idx].id()
+        self.tex[idx].handle.id()
+    }
+}
+
+/// Applies contrast, brightness and saturation to an RGBA buffer.
+///
+/// Contrast and brightness run through a 256-entry curve on luma and saturation scales the
+/// colour difference from that luma, which is the same decomposition ffmpeg's `eq` filter uses,
+/// so what the preview shows is what the export produces.
+fn apply_color(src: &[u8], dst: &mut Vec<u8>, adj: &ColorAdjust) {
+    dst.clear();
+    dst.reserve(src.len());
+    let lut = adj.luma_lut();
+    let sat = adj.saturation;
+    for px in src.chunks_exact(4) {
+        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        let y2 = lut[(y as usize).min(255)] as f32;
+        dst.push(((y2 + (r - y) * sat).clamp(0.0, 255.0)) as u8);
+        dst.push(((y2 + (g - y) * sat).clamp(0.0, 255.0)) as u8);
+        dst.push(((y2 + (b - y) * sat).clamp(0.0, 255.0)) as u8);
+        dst.push(px[3]);
     }
 }
 
@@ -1337,6 +1606,13 @@ fn downsample(img: &crate::decode::DecodedFrame, max_w: u32) -> egui::ColorImage
         }
     }
     egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &out)
+}
+
+fn autosave_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Kite")
+        .join("recovery.kite")
 }
 
 fn default_export_path() -> PathBuf {
@@ -1385,6 +1661,7 @@ impl eframe::App for App {
 
         self.poll_import();
         self.poll_export();
+        self.autosave();
         self.advance();
         self.rebuild_audio_if_needed();
         self.shortcuts(ctx);

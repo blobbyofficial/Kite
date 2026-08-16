@@ -191,11 +191,14 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     let mut b = project.new_clip(ClipSource::Media(media_id), 45, 45, 70);
     b.volume = 0.5;
     b.fade_out = 6;
+    // Dissolve into the second clip; clip a has plenty of material past its out point.
+    b.transition_in = 10;
     let mut pip = project.new_clip(ClipSource::Media(media_id), 20, 30, 10);
     pip.scale = 0.35;
     pip.pos_x = 0.3;
     pip.pos_y = -0.3;
     pip.opacity = 0.9;
+    pip.color = crate::project::ColorAdjust { brightness: 0.02, contrast: 1.15, saturation: 1.2 };
     let text = project.new_clip(
         ClipSource::Text(TextProps { text: "Kite self-test".into(), ..Default::default() }),
         10,
@@ -290,10 +293,16 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         size / 1024
     );
 
-    // ---- 7. a graph big enough to have overflowed a command line ----------
+    // ---- 7. does a crossfade actually dissolve? ----------------------------
+    dissolve_check(&tools, &dir, &src, info.duration)?;
+
+    // ---- 7b. speed changes --------------------------------------------------
+    speed_check(&tools, &dir, &src, info.duration)?;
+
+    // ---- 8. a graph big enough to have overflowed a command line ----------
     big_graph_check(&tools, &dir, &src, info.duration)?;
 
-    // ---- 8. does the timeline model scale? --------------------------------
+    // ---- 9. does the timeline model scale? --------------------------------
     scale_check()?;
 
     std::fs::remove_dir_all(&dir).ok();
@@ -301,14 +310,91 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     Ok(())
 }
 
-/// Exports a timeline with enough cuts that the filtergraph is far past the Windows command-line
-/// limit, which is why it goes to ffmpeg as a script file rather than an argument.
-fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::Path, dur: f64) -> Result<()> {
-    const CUTS: i64 = 120;
+/// Mean colourfulness of one frame, used to tell a dissolve apart from a hard cut.
+fn frame_chroma(tools: &Tools, file: &std::path::Path, at: f64) -> Result<f64> {
+    let out = ffmpeg::command(&tools.ffmpeg)
+        .args(["-v", "error", "-ss", &format!("{at:.3}"), "-i"])
+        .arg(file)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("sampling an exported frame")?;
+    if !out.status.success() || out.stdout.is_empty() {
+        bail!("could not sample a frame at {at}s");
+    }
+    let mut total = 0f64;
+    let mut n = 0f64;
+    for px in out.stdout.chunks_exact(3) {
+        let hi = *px.iter().max().unwrap() as f64;
+        let lo = *px.iter().min().unwrap() as f64;
+        total += hi - lo;
+        n += 1.0;
+    }
+    Ok(total / n.max(1.0))
+}
+
+/// Renders a greyscale clip dissolving into a colour one, then samples three frames from the
+/// exported file. A successful export proves nothing on its own — if the dissolve were dropped,
+/// the middle frame would match one side exactly. It has to sit between them.
+fn dissolve_check(
+    tools: &Arc<Tools>,
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    dur: f64,
+) -> Result<()> {
     let mut project = Project::default();
     let media_id = project.alloc_id();
-    project.media.push(MediaItem {
-        id: media_id,
+    project.media.push(media_item(media_id, src, dur));
+    let tid = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .last()
+        .map(|t| t.id)
+        .context("no video track")?;
+
+    let mut a = project.new_clip(ClipSource::Media(media_id), 0, 30, 0);
+    a.color.saturation = 0.0; // fully grey
+    let mut b = project.new_clip(ClipSource::Media(media_id), 30, 30, 60);
+    b.transition_in = 20;
+    project.track_mut(tid).unwrap().clips.push(a);
+    project.track_mut(tid).unwrap().clips.push(b);
+    project.normalize();
+
+    let out = dir.join("dissolve.mp4");
+    let settings = ExportSettings {
+        path: out.clone(),
+        encoder: Encoder::X264,
+        quality: Quality::High,
+        width: 320,
+        height: 180,
+        fps: 30,
+    };
+    run_export_blocking(tools, project, settings)?;
+
+    // frame 15 = grey only, frame 40 = halfway through the dissolve, frame 57 = colour only
+    let grey = frame_chroma(tools, &out, 15.0 / 30.0)?;
+    let mid = frame_chroma(tools, &out, 40.0 / 30.0)?;
+    let colour = frame_chroma(tools, &out, 57.0 / 30.0)?;
+
+    if colour <= grey + 5.0 {
+        bail!("the colour test frames are not distinguishable (grey {grey:.1}, colour {colour:.1})");
+    }
+    if mid <= grey + 2.0 {
+        bail!("mid-dissolve frame is still fully greyscale — the crossfade did not render");
+    }
+    if mid >= colour - 2.0 {
+        bail!("mid-dissolve frame is already fully coloured — the crossfade did not render");
+    }
+    std::fs::remove_file(&out).ok();
+    pass!("crossfade dissolves (chroma {grey:.1} → {mid:.1} → {colour:.1})");
+    Ok(())
+}
+
+fn media_item(id: u64, src: &std::path::Path, dur: f64) -> MediaItem {
+    MediaItem {
+        id,
         path: src.to_path_buf(),
         name: "source.mp4".into(),
         duration: dur,
@@ -323,7 +409,89 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         peaks_path: None,
         state: ImportState::Ready,
         error: None,
-    });
+    }
+}
+
+/// A clip played at double speed should consume twice its timeline length in source and land at
+/// exactly half the duration, with the audio retimed to match rather than dropped.
+fn speed_check(
+    tools: &Arc<Tools>,
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    dur: f64,
+) -> Result<()> {
+    let mut project = Project::default();
+    let media_id = project.alloc_id();
+    project.media.push(media_item(media_id, src, dur));
+    let tid = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .last()
+        .map(|t| t.id)
+        .context("no video track")?;
+
+    let mut fast = project.new_clip(ClipSource::Media(media_id), 0, 30, 0);
+    fast.speed = 2.0;
+    if fast.source_span() != 60 {
+        bail!("a 30 frame clip at 2x should consume 60 source frames, got {}", fast.source_span());
+    }
+    if fast.source_frame(15) != 30 {
+        bail!("frame mapping at 2x is wrong: {}", fast.source_frame(15));
+    }
+    project.track_mut(tid).unwrap().clips.push(fast);
+    project.normalize();
+
+    let out = dir.join("speed.mp4");
+    let settings = ExportSettings {
+        path: out.clone(),
+        encoder: Encoder::X264,
+        quality: Quality::Small,
+        width: 640,
+        height: 360,
+        fps: 30,
+    };
+    run_export_blocking(tools, project, settings)?;
+    let probed = ffmpeg::probe(tools, &out)?;
+    if (probed.duration - 1.0).abs() > 0.3 {
+        bail!("2x clip exported as {:.2}s, expected 1.0s", probed.duration);
+    }
+    if !probed.has_audio {
+        bail!("retimed clip lost its audio");
+    }
+    std::fs::remove_file(&out).ok();
+    pass!("2x speed exported at {:.2}s with audio", probed.duration);
+    Ok(())
+}
+
+fn run_export_blocking(
+    tools: &Arc<Tools>,
+    project: Project,
+    settings: ExportSettings,
+) -> Result<()> {
+    let job = export::start(tools.clone(), project, settings, None);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if Instant::now() > deadline {
+            bail!("export timed out");
+        }
+        match job.rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(ExportMsg::Done(_)) => return Ok(()),
+            Ok(ExportMsg::Failed(e)) => bail!("export failed: {e}"),
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(e) => bail!("export channel closed: {e}"),
+        }
+    }
+}
+
+/// Exports a timeline with enough cuts that the filtergraph is far past the Windows command-line
+/// limit, which is why it goes to ffmpeg as a script file rather than an argument.
+fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::Path, dur: f64) -> Result<()> {
+    const CUTS: i64 = 120;
+    let mut project = Project::default();
+    let media_id = project.alloc_id();
+    project.media.push(media_item(media_id, src, dur));
     let tid = project
         .tracks
         .iter()
@@ -354,20 +522,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         println!("  --  graph is {len} chars, smaller than expected but still exercised");
     }
 
-    let job = export::start(tools.clone(), project, settings, None);
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        if Instant::now() > deadline {
-            bail!("large export timed out");
-        }
-        match job.rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(ExportMsg::Done(_)) => break,
-            Ok(ExportMsg::Failed(e)) => bail!("large export failed: {e}"),
-            Ok(_) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(e) => bail!("large export channel closed: {e}"),
-        }
-    }
+    run_export_blocking(tools, project, settings)?;
     let probed = ffmpeg::probe(tools, &out)?;
     let expected = (CUTS * 5) as f64 / 30.0;
     if (probed.duration - expected).abs() > 0.5 {

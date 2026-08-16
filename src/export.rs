@@ -315,11 +315,19 @@ pub fn build_graph(
         .collect();
 
     for track in video_tracks.iter().rev() {
-        for clip in &track.clips {
+        for (i, clip) in track.clips.iter().enumerate() {
+            // If the next clip dissolves in, this one keeps rolling underneath for that long.
+            let tail = track
+                .clips
+                .get(i + 1)
+                .map(|n| n.transition_in.max(0))
+                .unwrap_or(0);
             let t0 = clip.start as f64 / fps as f64;
-            let t1 = clip.end() as f64 / fps as f64;
+            let t1 = (clip.end() + tail) as f64 / fps as f64;
             let fade_in = clip.fade_in as f64 / fps as f64;
             let fade_out = clip.fade_out as f64 / fps as f64;
+            let dissolve_in = clip.transition_in.max(0) as f64 / fps as f64;
+            let dissolve_out = tail as f64 / fps as f64;
 
             match &clip.source {
                 ClipSource::Media(mid) => {
@@ -328,18 +336,28 @@ pub fn build_graph(
                         continue;
                     }
                     let Some(&idx) = index_of.get(mid) else { continue };
+                    let speed = clip.speed.max(0.01) as f64;
                     let src_in = clip.src_in as f64 / fps as f64;
-                    let src_out = src_in + (clip.len as f64 / fps as f64);
+                    let src_out = src_in + ((clip.len + tail) as f64 * speed / fps as f64);
 
                     let (cw, ch) = fitted_size(m.src_width, m.src_height, w, h, clip.scale);
                     let lbl = g.label("v");
-                    let mut chain = format!(
-                        "[{idx}:v]trim=start={}:end={},setpts=PTS-STARTPTS+{}/TB,\
-                         scale={cw}:{ch}:flags=bicubic,fps={fps},format=rgba",
-                        f(src_in),
-                        f(src_out),
-                        f(t0)
-                    );
+                    let mut chain = format!("[{idx}:v]trim=start={}:end={}", f(src_in), f(src_out));
+                    // setpts both retimes for speed and slides the clip to its place on the line.
+                    if (speed - 1.0).abs() > 1e-6 {
+                        chain.push_str(&format!(",setpts=(PTS-STARTPTS)/{}+{}/TB", f(speed), f(t0)));
+                    } else {
+                        chain.push_str(&format!(",setpts=PTS-STARTPTS+{}/TB", f(t0)));
+                    }
+                    if !clip.color.is_neutral() {
+                        chain.push_str(&format!(
+                            ",eq=contrast={:.4}:brightness={:.4}:saturation={:.4}",
+                            clip.color.contrast, clip.color.brightness, clip.color.saturation
+                        ));
+                    }
+                    chain.push_str(&format!(
+                        ",scale={cw}:{ch}:flags=bicubic,fps={fps},format=rgba"
+                    ));
                     if clip.opacity < 0.999 {
                         chain.push_str(&format!(",colorchannelmixer=aa={:.4}", clip.opacity));
                     }
@@ -353,8 +371,23 @@ pub fn build_graph(
                     if fade_out > 0.0 {
                         chain.push_str(&format!(
                             ",fade=t=out:st={}:d={}:alpha=1",
-                            f(t1 - fade_out),
+                            f(t1 - dissolve_out - fade_out),
                             f(fade_out)
+                        ));
+                    }
+                    // The dissolve itself: this clip fades away while the next fades up over it.
+                    if dissolve_in > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=in:st={}:d={}:alpha=1",
+                            f(t0),
+                            f(dissolve_in)
+                        ));
+                    }
+                    if dissolve_out > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=out:st={}:d={}:alpha=1",
+                            f(t1 - dissolve_out),
+                            f(dissolve_out)
                         ));
                     }
                     chain.push_str(&format!("[{lbl}]"));
@@ -372,16 +405,32 @@ pub fn build_graph(
                 }
                 ClipSource::Color(rgba) => {
                     let lbl = g.label("v");
-                    g.push(format!(
+                    let mut chain = format!(
                         "color=c=0x{:02x}{:02x}{:02x}@{:.3}:s={w}x{h}:r={fps}:d={},format=rgba,\
-                         setpts=PTS-STARTPTS+{}/TB[{lbl}]",
+                         setpts=PTS-STARTPTS+{}/TB",
                         rgba[0],
                         rgba[1],
                         rgba[2],
                         rgba[3] as f32 / 255.0,
                         f(t1 - t0),
                         f(t0)
-                    ));
+                    );
+                    if dissolve_in > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=in:st={}:d={}:alpha=1",
+                            f(t0),
+                            f(dissolve_in)
+                        ));
+                    }
+                    if dissolve_out > 0.0 {
+                        chain.push_str(&format!(
+                            ",fade=t=out:st={}:d={}:alpha=1",
+                            f(t1 - dissolve_out),
+                            f(dissolve_out)
+                        ));
+                    }
+                    chain.push_str(&format!("[{lbl}]"));
+                    g.push(chain);
                     let out = g.label("c");
                     g.push(format!(
                         "[{current}][{lbl}]overlay=x=0:y=0:eof_action=pass:\
@@ -436,7 +485,12 @@ pub fn build_graph(
     // --- audio ---
     let mut alabels: Vec<String> = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
-        for clip in &track.clips {
+        for (i, clip) in track.clips.iter().enumerate() {
+            let tail = track
+                .clips
+                .get(i + 1)
+                .map(|n| n.transition_in.max(0))
+                .unwrap_or(0);
             let Some(mid) = clip.media_id() else { continue };
             let Some(m) = project.media(mid) else { continue };
             if !m.has_audio {
@@ -444,9 +498,10 @@ pub fn build_graph(
             }
             // A muted video track still contributes its audio unless the track itself is muted.
             let Some(&idx) = index_of.get(&mid) else { continue };
+            let speed = clip.speed.max(0.01) as f64;
             let t0 = clip.start as f64 / fps as f64;
             let src_in = clip.src_in as f64 / fps as f64;
-            let src_out = src_in + (clip.len as f64 / fps as f64);
+            let src_out = src_in + ((clip.len + tail) as f64 * speed / fps as f64);
             let delay_ms = (t0 * 1000.0).round() as i64;
             let lbl = g.label("a");
             let mut chain = format!(
@@ -455,6 +510,9 @@ pub fn build_graph(
                 f(src_in),
                 f(src_out)
             );
+            for step in atempo_chain(speed) {
+                chain.push_str(&format!(",atempo={}", f(step)));
+            }
             if (clip.volume - 1.0).abs() > 0.001 {
                 chain.push_str(&format!(",volume={:.4}", clip.volume));
             }
@@ -464,10 +522,22 @@ pub fn build_graph(
                     f(clip.fade_in as f64 / fps as f64)
                 ));
             }
+            let played = (clip.len + tail) as f64 / fps as f64;
             if clip.fade_out > 0 {
-                let len = clip.len as f64 / fps as f64;
                 let d = clip.fade_out as f64 / fps as f64;
-                chain.push_str(&format!(",afade=t=out:st={}:d={}", f(len - d), f(d)));
+                chain.push_str(&format!(
+                    ",afade=t=out:st={}:d={}",
+                    f(played - tail as f64 / fps as f64 - d),
+                    f(d)
+                ));
+            }
+            if clip.transition_in > 0 {
+                let d = clip.transition_in as f64 / fps as f64;
+                chain.push_str(&format!(",afade=t=in:st=0:d={}", f(d)));
+            }
+            if tail > 0 {
+                let d = tail as f64 / fps as f64;
+                chain.push_str(&format!(",afade=t=out:st={}:d={}", f(played - d), f(d)));
             }
             if delay_ms > 0 {
                 chain.push_str(&format!(",adelay={delay_ms}|{delay_ms}"));
@@ -489,6 +559,25 @@ pub fn build_graph(
     }
 
     Ok((inputs, g.join(), has_audio))
+}
+
+/// ffmpeg's `atempo` only accepts 0.5–2.0 per instance, so larger speed changes are chained.
+fn atempo_chain(speed: f64) -> Vec<f64> {
+    if (speed - 1.0).abs() < 1e-6 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut remaining = speed.clamp(0.05, 20.0);
+    while remaining > 2.0 {
+        out.push(2.0);
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        out.push(0.5);
+        remaining /= 0.5;
+    }
+    out.push(remaining);
+    out
 }
 
 fn fitted_size(sw: u32, sh: u32, w: i64, h: i64, scale: f32) -> (i64, i64) {

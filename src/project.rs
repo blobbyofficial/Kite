@@ -143,6 +143,53 @@ pub enum ClipSource {
     Color([u8; 4]),
 }
 
+fn one() -> f32 {
+    1.0
+}
+
+/// Colour correction, modelled on ffmpeg's `eq` filter so the preview and the export agree:
+/// contrast and brightness act on luma, saturation on chroma.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ColorAdjust {
+    /// Added to luma, -1..1.
+    pub brightness: f32,
+    /// Multiplies luma around mid grey, 0..3.
+    pub contrast: f32,
+    /// Multiplies chroma, 0..3.
+    pub saturation: f32,
+}
+
+impl Default for ColorAdjust {
+    fn default() -> Self {
+        Self { brightness: 0.0, contrast: 1.0, saturation: 1.0 }
+    }
+}
+
+impl ColorAdjust {
+    pub fn is_neutral(&self) -> bool {
+        self.brightness.abs() < 1e-4
+            && (self.contrast - 1.0).abs() < 1e-4
+            && (self.saturation - 1.0).abs() < 1e-4
+    }
+    /// A stable key for cache comparisons.
+    pub fn key(&self) -> u64 {
+        let b = (self.brightness * 10_000.0) as i64;
+        let c = (self.contrast * 10_000.0) as i64;
+        let s = (self.saturation * 10_000.0) as i64;
+        ((b as u64) << 42) ^ ((c as u64) << 21) ^ (s as u64)
+    }
+    /// 256-entry curve for the luma channel; the same maths ffmpeg's `eq` applies.
+    pub fn luma_lut(&self) -> [u8; 256] {
+        let mut lut = [0u8; 256];
+        for (i, out) in lut.iter_mut().enumerate() {
+            let v = i as f32 / 255.0;
+            let v = self.contrast * (v - 0.5) + 0.5 + self.brightness;
+            *out = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        lut
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
@@ -162,6 +209,15 @@ pub struct Clip {
     pub pos_y: f32,
     pub fade_in: i64,
     pub fade_out: i64,
+    /// Cross-dissolve with the clip immediately before this one on the same track, in frames.
+    /// The earlier clip keeps rolling into this window using material past its out point, so the
+    /// sequence does not get shorter.
+    #[serde(default)]
+    pub transition_in: i64,
+    #[serde(default)]
+    pub color: ColorAdjust,
+    #[serde(default = "one")]
+    pub speed: f32,
     pub selected: bool,
 }
 
@@ -174,7 +230,17 @@ impl Clip {
     }
     /// Source frame that should be shown for timeline frame `f`.
     pub fn source_frame(&self, f: i64) -> i64 {
-        self.src_in + (f - self.start)
+        let local = f - self.start;
+        if (self.speed - 1.0).abs() < 1e-4 {
+            self.src_in + local
+        } else {
+            self.src_in + (local as f64 * self.speed as f64).round() as i64
+        }
+    }
+
+    /// How much source material this clip consumes, which is what limits trimming.
+    pub fn source_span(&self) -> i64 {
+        ((self.len as f64) * self.speed.max(0.01) as f64).ceil() as i64
     }
     pub fn gain_at(&self, f: i64) -> f32 {
         let local = f - self.start;
@@ -239,6 +305,16 @@ impl Track {
         // Clips are sorted and non-overlapping, so a binary search is exact.
         let i = self.clips.partition_point(|c| c.end() <= f);
         self.clips.get(i).filter(|c| c.contains(f))
+    }
+
+    /// The clip immediately before `id` on this track, which is the one a crossfade dissolves from.
+    pub fn prev_clip(&self, id: ClipId) -> Option<&Clip> {
+        let i = self.clips.iter().position(|c| c.id == id)?;
+        if i == 0 {
+            None
+        } else {
+            self.clips.get(i - 1)
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -376,6 +452,9 @@ impl Project {
             pos_y: 0.0,
             fade_in: 0,
             fade_out: 0,
+            transition_in: 0,
+            color: ColorAdjust::default(),
+            speed: 1.0,
             selected: false,
         }
     }
@@ -470,6 +549,72 @@ impl History {
     }
     pub fn can_redo(&self) -> bool {
         !self.future.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_adjust_is_identity() {
+        let lut = ColorAdjust::default().luma_lut();
+        for i in [0usize, 1, 64, 128, 200, 255] {
+            assert_eq!(lut[i], i as u8, "neutral curve changed value {i}");
+        }
+        assert!(ColorAdjust::default().is_neutral());
+    }
+
+    #[test]
+    fn contrast_pushes_away_from_mid_grey() {
+        let lut = ColorAdjust { contrast: 1.5, ..Default::default() }.luma_lut();
+        assert!(lut[200] > 200, "highlights should lift");
+        assert!(lut[50] < 50, "shadows should drop");
+        assert_eq!(lut[128], 128, "mid grey is the pivot");
+    }
+
+    #[test]
+    fn speed_maps_source_frames_and_span() {
+        let mut p = Project::default();
+        let mut c = p.new_clip(ClipSource::Color([0; 4]), 0, 30, 0);
+        c.speed = 2.0;
+        assert_eq!(c.source_span(), 60);
+        assert_eq!(c.source_frame(0), 0);
+        assert_eq!(c.source_frame(15), 30);
+        c.speed = 0.5;
+        assert_eq!(c.source_span(), 15);
+        assert_eq!(c.source_frame(10), 5);
+    }
+
+    #[test]
+    fn prev_clip_finds_the_neighbour_a_dissolve_uses() {
+        let mut p = Project::default();
+        let a = p.new_clip(ClipSource::Color([0; 4]), 0, 30, 0);
+        let b = p.new_clip(ClipSource::Color([0; 4]), 30, 30, 0);
+        let (aid, bid) = (a.id, b.id);
+        let tid = p.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id;
+        let t = p.track_mut(tid).unwrap();
+        t.clips.push(a);
+        t.clips.push(b);
+        t.normalize();
+        let t = p.track(tid).unwrap();
+        assert_eq!(t.prev_clip(bid).map(|c| c.id), Some(aid));
+        assert!(t.prev_clip(aid).is_none());
+    }
+
+    #[test]
+    fn old_projects_without_the_new_fields_still_load() {
+        // A project written before transitions, colour and speed existed.
+        let json = r#"{"version":1,"name":"old","settings":{"width":1920,"height":1080,"fps":30},
+            "media":[],"tracks":[{"id":1,"kind":"Video","name":"V1","muted":false,"hidden":false,
+            "locked":false,"height":64.0,"clips":[{"id":2,"source":{"Color":[0,0,0,255]},
+            "start":0,"len":30,"src_in":0,"volume":1.0,"opacity":1.0,"scale":1.0,"pos_x":0.0,
+            "pos_y":0.0,"fade_in":0,"fade_out":0,"selected":false}]}],"next_id":3}"#;
+        let p: Project = serde_json::from_str(json).expect("legacy project should still parse");
+        let c = &p.tracks[0].clips[0];
+        assert_eq!(c.transition_in, 0);
+        assert_eq!(c.speed, 1.0);
+        assert!(c.color.is_neutral());
     }
 }
 

@@ -17,13 +17,15 @@ also leaves the installer as a build artifact on the [Actions tab](../../actions
 
 Start with [docs/BETA-README.md](docs/BETA-README.md).
 
-**What it does today:** multi-track video and audio, trim and ripple editing, drag between
-tracks, snapping, split at the playhead, per-clip volume with fades, opacity, scale and position,
-titles, waveforms and thumbnails on the timeline, audio metering, undo/redo, project save/load,
-and H.264 export that uses hardware encoders when the machine has them.
+**What it does today:** multi-track video and audio, trim and ripple editing, multi-clip drag
+between tracks, snapping, rubber-band select, copy/paste, split at the playhead, crossfades,
+speed from 0.25× to 4× with retimed audio, per-clip brightness/contrast/saturation, volume with
+fades, opacity, scale and position, titles, waveforms and thumbnails on the timeline, audio
+metering, undo/redo, autosave with crash recovery, project save/load, and H.264 export that uses
+hardware encoders when the machine has them.
 
-**What it doesn't, yet:** colour grading, effects and transitions beyond fades, keyframes, and
-speed changes.
+**What it doesn't, yet:** colour wheels, curves and scopes; keyframes; transitions other than
+crossfade.
 
 ### How it stays fast
 
@@ -62,6 +64,10 @@ cargo build --release
 
 Needs `ffmpeg` and `ffprobe` on `PATH` or in an `ffmpeg` folder beside the binary. The installer
 is built by [.github/workflows/windows.yml](.github/workflows/windows.yml).
+
+Licensed under [PolyForm Small Business 1.0.0](LICENSE.md) — free for individuals, creators and
+small companies; see [LICENSING.md](LICENSING.md) for what that means in practice, including that
+anything you make with Kite is entirely yours.
 
 See [THIRD-PARTY.md](THIRD-PARTY.md) — the bundled ffmpeg is a GPL build, which needs a decision
 before any public release.

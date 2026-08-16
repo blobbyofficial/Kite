@@ -309,7 +309,8 @@
       <li><p><strong>Drag a clip's edge</strong> to trim it, or its middle to move it — including
       onto another track for b-roll.</p></li>
       <li><p><strong>Add a title</strong> with the <kbd>T</kbd> button, then edit the wording,
-      size, colour and position in the inspector.</p></li>
+      size, colour and position in the inspector. Select a clip and press <kbd>Ctrl</kbd>+<kbd>T</kbd>
+      to dissolve into it from the one before.</p></li>
       <li><p><strong>Press <kbd>Ctrl</kbd>+<kbd>E</kbd> to export.</strong> Kite uses your
       graphics card's encoder if it has one.</p></li>
     </ol>
@@ -323,6 +324,8 @@
           <tr><td class="k">← →</td><td>Step one frame — hold Shift for a second</td></tr>
           <tr><td class="k">S</td><td>Split at the playhead</td></tr>
           <tr><td class="k">Shift + Del</td><td>Ripple delete — remove and close the gap</td></tr>
+          <tr><td class="k">Ctrl + T</td><td>Crossfade into the selected clip</td></tr>
+          <tr><td class="k">Ctrl + C / V</td><td>Copy and paste at the playhead</td></tr>
           <tr><td class="k">Ctrl + D</td><td>Duplicate the selection</td></tr>
           <tr><td class="k">, and .</td><td>Nudge the selection by a frame</td></tr>
           <tr><td class="k">M</td><td>Snapping on / off</td></tr>
@@ -344,13 +347,15 @@
       <table>
         <thead><tr><th>Area</th><th>In this build</th></tr></thead>
         <tbody>
-          <tr><td class="k">Timeline</td><td class="y">Multi-track video and audio, trim, ripple delete, split, drag between tracks, snapping, duplicate, nudge</td></tr>
-          <tr><td class="k">Picture</td><td class="y">Opacity, scale, position, fades, titles with colour and alignment</td></tr>
+          <tr><td class="k">Timeline</td><td class="y">Multi-track video and audio, trim, ripple delete, split, drag between tracks, snapping, rubber-band select, copy and paste, duplicate, nudge</td></tr>
+          <tr><td class="k">Picture</td><td class="y">Opacity, scale, position, fades, crossfades between clips, titles with colour and alignment</td></tr>
+          <tr><td class="k">Colour</td><td class="y">Brightness, contrast and saturation per clip, with one-click looks</td></tr>
+          <tr><td class="k">Speed</td><td class="y">0.25× to 4×, with the audio retimed to match</td></tr>
           <tr><td class="k">Audio</td><td class="y">Per-clip volume in dB, fades, waveforms, level meters</td></tr>
-          <tr><td class="k">Project</td><td class="y">Undo/redo, save and reopen, automatic playback-file cache</td></tr>
+          <tr><td class="k">Project</td><td class="y">Undo/redo, save and reopen, autosave with crash recovery, automatic playback-file cache</td></tr>
           <tr><td class="k">Export</td><td class="y">H.264 MP4 from your original media, hardware encoding when available</td></tr>
-          <tr><td class="k">Colour</td><td class="n">Not yet — no grading, curves or scopes</td></tr>
-          <tr><td class="k">Effects</td><td class="n">Not yet — no transitions beyond fades, no keyframes, no speed changes</td></tr>
+          <tr><td class="k">Grading</td><td class="n">Not yet — no curves, wheels or scopes</td></tr>
+          <tr><td class="k">Effects</td><td class="n">Not yet — no keyframes, and crossfade is the only transition</td></tr>
           <tr><td class="k">Other</td><td class="n">Windows only for now. No 3D, no motion graphics</td></tr>
         </tbody>
       </table>
