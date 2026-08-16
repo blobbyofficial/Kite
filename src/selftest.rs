@@ -11,6 +11,7 @@ use crate::import::{ImportMsg, Importer};
 use crate::project::{ClipSource, ImportState, MediaItem, Project, TextProps, TrackKind};
 use anyhow::{bail, Context, Result};
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     pass!("sequential decode {seq:.2} ms/frame");
 
     let audio_file = audio_path.context("no audio track was extracted")?;
+    let audio_for_mix = audio_file.clone();
     let audio_bytes = std::fs::metadata(&audio_file)?.len();
     let expect = 4.0 * 48_000.0 * 4.0;
     if (audio_bytes as f64) < expect * 0.8 {
@@ -244,20 +246,6 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         fps: project.seq().fps,
         include_audio: true,
     };
-    let (inputs, graph, has_audio) = export::build_audio_graph(&project, project.tl(), &settings, 1);
-    if inputs.len() != 1 {
-        bail!("expected one audio input file, got {}", inputs.len());
-    }
-    if !has_audio {
-        bail!("export graph produced no audio");
-    }
-    step!(
-        "audio filtergraph is {} chars over {} input(s), passed as {:?}",
-        graph.len(),
-        inputs.len(),
-        export::graph_arg(&tools)
-    );
-
     let t0 = Instant::now();
     let job = export::start(tools.clone(), project.clone(), project.tl().id, settings.clone());
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -304,6 +292,9 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     // ---- 7c. one renderer: the preview and the export must agree ----------
     parity_check(&tools, &dir, &src, info.duration, media_id, &cache)?;
 
+    // ---- 7c2. one mixer: the preview and the export must agree ------------
+    audio_parity_check(&tools, &dir, &src, info.duration, media_id, &audio_for_mix)?;
+
     // ---- 7d. the interactive path has to stay inside its budget -----------
     preview_budget_check(&cache, media_id, &src, info.duration)?;
 
@@ -331,12 +322,10 @@ pub fn export_cli(tools: Arc<Tools>, project_path: &str, out: &str) -> Result<()
         fps: project.seq().fps,
         include_audio: true,
     };
-    let (inputs, graph, has_audio) = export::build_audio_graph(&project, project.tl(), &settings, 1);
-    println!("audio inputs: {inputs:#?}");
-    println!("has_audio: {has_audio}");
-    println!("--- audio filtergraph ---\n{graph}\n---");
+    let (clips, silent, muted) = export::audio_summary(&project, project.tl());
+    println!("audio: {clips} clip(s), {silent} at zero volume, muted track with sound: {muted}");
     println!(
-        "--- video ---\n{} frames composited on the GPU at {}x{}\n---",
+        "video: {} frames composited on the GPU at {}x{}",
         project.tl().duration(),
         settings.width,
         settings.height
@@ -663,9 +652,6 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         fps: 30,
             include_audio: true,
     };
-    let (_, graph, _) = export::build_audio_graph(&project, project.tl(), &settings, 1);
-    let len = graph.len();
-
     run_export_blocking(tools, project, settings)?;
     let probed = ffmpeg::probe(tools, &out)?;
     let expected = (CUTS * 5) as f64 / 30.0;
@@ -673,7 +659,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         bail!("large export is {:.2}s, expected {expected:.2}s", probed.duration);
     }
     std::fs::remove_file(&out).ok();
-    pass!("{CUTS}-cut timeline rendered, audio filtergraph {len} chars");
+    pass!("{CUTS}-cut timeline rendered");
     Ok(())
 }
 
@@ -942,6 +928,291 @@ fn parity_check(
     pass!(
         "preview and export render the same pixels (worst {worst:.2} per channel, \
          unrelated frames {control:.1})"
+    );
+    Ok(())
+}
+
+/// Serves the mixer from a file on disk, the way the application serves it from what it has
+/// already mapped.
+struct FilePcm {
+    media: u64,
+    path: PathBuf,
+    opened: Option<Arc<memmap2::Mmap>>,
+}
+
+impl crate::mix::PcmSource for FilePcm {
+    fn pcm(&mut self, media: u64) -> Option<Arc<memmap2::Mmap>> {
+        if media != self.media {
+            return None;
+        }
+        if self.opened.is_none() {
+            self.opened = crate::audio::open_pcm(&self.path);
+        }
+        self.opened.clone()
+    }
+}
+
+/// Decodes a rendered file's sound back to the project's own format, so it can be compared with
+/// what the mixer produced.
+fn decode_audio_f32(tools: &Tools, file: &std::path::Path) -> Result<Vec<f32>> {
+    let out = ffmpeg::command(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(file)
+        .args(["-vn", "-f", "f32le", "-ac", "2", "-ar"])
+        .arg(crate::project::SAMPLE_RATE.to_string())
+        .arg("-")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("decoding the rendered sound")?;
+    if !out.status.success() {
+        bail!(
+            "could not decode the rendered sound: {}",
+            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown")
+        );
+    }
+    Ok(out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Root mean square of the left channel over a range of frames, which is how loud something is.
+fn rms(samples: &[f32], from: usize, frames: usize) -> f64 {
+    let mut total = 0f64;
+    let mut n = 0f64;
+    for i in from..(from + frames) {
+        if i * 2 >= samples.len() {
+            break;
+        }
+        total += (samples[i * 2] as f64).powi(2);
+        n += 1.0;
+    }
+    if n == 0.0 {
+        return 0.0;
+    }
+    (total / n).sqrt()
+}
+
+/// Mean absolute difference per sample over a range of frames, with `b` shifted by `offset`.
+fn sample_diff(a: &[f32], b: &[f32], from: usize, frames: usize, offset: i64) -> f64 {
+    let mut total = 0f64;
+    let mut n = 0f64;
+    for i in from..(from + frames) {
+        let j = i as i64 + offset;
+        if j < 0 || i * 2 + 1 >= a.len() || (j as usize) * 2 + 1 >= b.len() {
+            continue;
+        }
+        let j = j as usize;
+        total += (a[i * 2] as f64 - b[j * 2] as f64).abs();
+        total += (a[i * 2 + 1] as f64 - b[j * 2 + 1] as f64).abs();
+        n += 2.0;
+    }
+    if n == 0.0 {
+        return f64::MAX;
+    }
+    total / n
+}
+
+/// The dominant period of a signal, in samples, found by autocorrelation. Used to prove a retimed
+/// clip still has the pitch it started with.
+fn period_of(samples: &[f32], from: usize, frames: usize) -> i64 {
+    let mut best = 0i64;
+    let mut best_score = f32::NEG_INFINITY;
+    for lag in 30..500i64 {
+        let mut dot = 0f32;
+        for j in 0..frames {
+            let a = samples.get((from + j) * 2).copied().unwrap_or(0.0);
+            let b = samples.get((from + j + lag as usize) * 2).copied().unwrap_or(0.0);
+            dot += a * b;
+        }
+        if dot > best_score {
+            best_score = dot;
+            best = lag;
+        }
+    }
+    best
+}
+
+/// A timeline that exercises everything the two mixers used to implement separately: two clips at
+/// different volumes, a fade in and a fade out, an audio crossfade, a clip that does not start at
+/// zero, and a clip whose speed is not 1.
+fn audio_parity_project(media_id: u64, src: &std::path::Path, dur: f64) -> Result<Project> {
+    let mut project = Project::default();
+    project.media.push(media_item(media_id, src, dur));
+    let tid = project
+        .tracks()
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .last()
+        .map(|t| t.id)
+        .context("no video track")?;
+
+    // frames 0..50, loud, fading in from silence
+    let mut a = project.new_clip(ClipSource::Media(media_id), 0, 50, 0);
+    a.volume = 0.8;
+    a.fade_in = 10;
+    // frames 50..100, quiet, dissolving in over the tail of the first and fading out at its end.
+    // The fade-out belongs to this clip rather than to `a`, or `a`'s own fade would reach silence
+    // exactly where the dissolve starts and there would be nothing to cross.
+    let mut b = project.new_clip(ClipSource::Media(media_id), 50, 50, 30);
+    b.volume = 0.35;
+    b.transition_in = 15;
+    b.fade_out = 10;
+    // frames 115..145, after a gap, at double speed
+    let mut c = project.new_clip(ClipSource::Media(media_id), 115, 30, 0);
+    c.speed = 2.0;
+    c.volume = 0.9;
+
+    project.track_mut(tid).context("no track")?.clips.push(a);
+    project.track_mut(tid).context("no track")?.clips.push(b);
+    project.track_mut(tid).context("no track")?.clips.push(c);
+    project.normalize();
+    Ok(project)
+}
+
+/// **The exit criterion for the mixer.**
+///
+/// The same timeline is mixed twice: once by the preview's mixer, straight out of `mix.rs`, and
+/// once by a real export that encodes to AAC and is then decoded back. The samples are compared.
+///
+/// As with the picture, the tolerance is justified rather than picked. Every comparison is also
+/// run against an *unrelated* stretch of the same render, and the check fails unless the matching
+/// region is far closer than that — so quietly widening the tolerance breaks the control instead
+/// of making the test pass.
+fn audio_parity_check(
+    tools: &Arc<Tools>,
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    dur: f64,
+    media_id: u64,
+    pcm_path: &std::path::Path,
+) -> Result<()> {
+    let project = audio_parity_project(media_id, src, dur)?;
+    if project.duration() != 145 {
+        bail!("the audio parity timeline is {} frames, expected 145", project.duration());
+    }
+
+    let out = dir.join("audio-parity.mp4");
+    let settings = ExportSettings {
+        path: out.clone(),
+        encoder: Encoder::X264,
+        quality: Quality::High,
+        width: 320,
+        height: 180,
+        fps: 30,
+        include_audio: true,
+    };
+    run_export_blocking(tools, project.clone(), settings)?;
+
+    let mut source = FilePcm { media: media_id, path: pcm_path.to_path_buf(), opened: None };
+    let plan =
+        crate::mix::plan_audio(&project, project.tl(), &mut source, &mut Default::default());
+    if plan.layers.len() != 3 {
+        bail!("the plan has {} layers, expected 3", plan.layers.len());
+    }
+    let total = (145i64 * crate::project::SAMPLE_RATE as i64) / 30;
+    let preview = plan.mix_range(0, total as usize);
+    let exported = decode_audio_f32(tools, &out)?;
+    if exported.len() < total as usize * 2 / 2 {
+        bail!("the rendered file has only {} samples of sound", exported.len() / 2);
+    }
+
+    // AAC has an encoder delay, so find the alignment before judging the difference. A large
+    // shift would itself be a fault, so the search is deliberately narrow.
+    let f = |frames: i64| (frames * crate::project::SAMPLE_RATE as i64 / 30) as usize;
+    let (probe_from, probe_len) = (f(20), f(20));
+    let mut offset = 0i64;
+    let mut best = f64::MAX;
+    for k in -4096..=4096i64 {
+        let d = sample_diff(&preview, &exported, probe_from, probe_len, k);
+        if d < best {
+            best = d;
+            offset = k;
+        }
+    }
+
+    // How loud the material actually is, so the numbers below are a fraction of the signal
+    // rather than an absolute that only holds for one test file.
+    let level = rms(&preview, f(25), f(15));
+    if level < 0.01 {
+        bail!("the parity mix is essentially silent ({level:.4}); the check would prove nothing");
+    }
+
+    // Compare across the whole timeline, not just the window the alignment was found on.
+    let matched = sample_diff(&preview, &exported, f(2), f(140), offset);
+    if matched > level * 0.03 {
+        bail!(
+            "the preview mix and the rendered sound differ by {matched:.4} per sample against a \
+             signal level of {level:.4} — the two paths are not producing the same audio"
+        );
+    }
+
+    // The control: the same preview samples against a stretch of the render they do not belong
+    // to. If the tolerance above were simply loose, this would pass too.
+    let control = sample_diff(&preview, &exported, f(10), f(20), offset + f(60) as i64);
+    if control < matched * 8.0 {
+        bail!(
+            "the check cannot tell one part of the mix from another: matching audio differs by \
+             {matched:.4} and unrelated audio by only {control:.4}"
+        );
+    }
+
+    // Each thing the timeline was built to exercise has to be present in *both* mixes.
+    let shift = |n: usize| (n as i64 + offset).max(0) as usize;
+    for (name, mix, off) in [("preview", &preview, 0usize), ("export", &exported, shift(0))] {
+        let one = rms(mix, off + f(25), f(15));
+        let two = rms(mix, off + f(72), f(13));
+        let head = rms(mix, off + f(1), f(2));
+        let tail = rms(mix, off + f(98), f(2));
+        let gap = rms(mix, off + f(103), f(8));
+        let delayed = rms(mix, off + f(125), f(10));
+        // Just inside the dissolve, where the outgoing clip is still nearly at full level. A hard
+        // cut would already be down at the incoming clip's level here.
+        let dissolve = rms(mix, off + f(51), f(2));
+
+        if one < level * 0.5 {
+            bail!("the {name} mix has no sound in the first clip ({one:.4})");
+        }
+        // 0.8 against 0.35 — the volumes have to survive as a ratio, not just as noise.
+        let ratio = one / two.max(1e-9);
+        if !(1.7..=3.0).contains(&ratio) {
+            bail!("the {name} mix has the two clips at a level ratio of {ratio:.2}, expected about 2.3");
+        }
+        if head > one * 0.35 {
+            bail!("the {name} mix does not fade in ({head:.4} against {one:.4})");
+        }
+        if gap > one * 0.05 {
+            bail!("the {name} mix has sound in the gap between clips ({gap:.4})");
+        }
+        if delayed < one * 0.5 {
+            bail!("the {name} mix lost the clip that starts late ({delayed:.4})");
+        }
+        if tail > two * 0.4 {
+            bail!("the {name} mix does not fade out ({tail:.4} against {two:.4})");
+        }
+        if dissolve < two * 1.4 {
+            bail!(
+                "the {name} mix cuts rather than crosses into the second clip: {dissolve:.4} just \
+                 inside the dissolve against {two:.4} after it"
+            );
+        }
+        // The retimed clip must still be a 440 Hz tone — about 109 samples per cycle. Resampling
+        // instead of stretching would halve that.
+        let p = period_of(mix, off + f(125), 2000);
+        if (p - 109).abs() > 6 {
+            bail!(
+                "the {name} mix has the retimed clip at a period of {p} samples, expected about \
+                 109 — the speed change is not pitch preserving"
+            );
+        }
+    }
+
+    std::fs::remove_file(&out).ok();
+    pass!(
+        "preview and export mix the same samples (offset {offset}, matched {matched:.4} against a \
+         {level:.3} signal, unrelated {control:.4})"
     );
     Ok(())
 }

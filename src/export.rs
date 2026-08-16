@@ -4,11 +4,13 @@
 //! Playback uses proxies, but delivery never does — the decoders below read the source files at
 //! full resolution, so what you export is the real quality regardless of what you edited against.
 //!
-//! Compositing is **not** here. It is in `render.rs`, shared with the preview, which is the whole
-//! point of the arrangement: ffmpeg does demux, decode and encode, and nothing else.
+//! Compositing is **not** here, and neither is mixing. Pictures come from `render.rs` and sound
+//! from `mix.rs`, both shared with the preview. That is the whole point of the arrangement:
+//! ffmpeg does demux, decode and encode, and nothing else. There is no filtergraph any more.
 
 use crate::decode::DecodedFrame;
 use crate::ffmpeg::{self, Tools};
+use crate::mix::{plan_audio, AudioPlan, PcmSource, RetimeCache, WavWriter};
 use crate::project::{ClipId, MediaId, Project, Timeline};
 use crate::render::{plan_frame, FrameSource, Gpu, Renderer};
 use anyhow::{anyhow, bail, Context, Result};
@@ -161,216 +163,6 @@ pub fn available_encoders(tools: &Tools) -> Vec<Encoder> {
     out
 }
 
-/// How this ffmpeg build accepts a filtergraph that is too large to pass as an argument.
-///
-/// `-filter_complex_script` was the long-standing spelling; ffmpeg 7 introduced the generic
-/// `-/option file` form and ffmpeg 8 removed the old one. Bundled builds move, so rather than
-/// guess from a version banner we ask ffmpeg once and remember the answer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GraphArg {
-    /// `-/filter_complex file` — ffmpeg 7 and later.
-    SlashFile,
-    /// `-filter_complex_script file` — ffmpeg 6 and earlier.
-    ScriptFile,
-    /// Neither worked; pass it inline and hope it fits the command line.
-    Inline,
-}
-
-static GRAPH_ARG: std::sync::OnceLock<GraphArg> = std::sync::OnceLock::new();
-
-pub fn graph_arg(tools: &Tools) -> GraphArg {
-    *GRAPH_ARG.get_or_init(|| detect_graph_arg(tools))
-}
-
-fn detect_graph_arg(tools: &Tools) -> GraphArg {
-    let dir = std::env::temp_dir().join(format!("kite-probe-{}", std::process::id()));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return GraphArg::Inline;
-    }
-    let name = "probe_graph.txt";
-    if std::fs::write(dir.join(name), b"[0:v]null[vout]").is_err() {
-        std::fs::remove_dir_all(&dir).ok();
-        return GraphArg::Inline;
-    }
-
-    let mut found = GraphArg::Inline;
-    for style in [GraphArg::SlashFile, GraphArg::ScriptFile] {
-        let mut cmd = ffmpeg::command(&tools.ffmpeg);
-        cmd.current_dir(&dir);
-        cmd.args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x32:d=0.1"]);
-        match style {
-            GraphArg::SlashFile => cmd.args(["-/filter_complex", name]),
-            GraphArg::ScriptFile => cmd.args(["-filter_complex_script", name]),
-            GraphArg::Inline => unreachable!(),
-        };
-        cmd.args(["-map", "[vout]", "-frames:v", "1", "-f", "null", "-"]);
-        let ok = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            found = style;
-            break;
-        }
-    }
-    std::fs::remove_dir_all(&dir).ok();
-    found
-}
-
-
-fn f(t: f64) -> String {
-    format!("{t:.6}")
-}
-
-struct Graph {
-    parts: Vec<String>,
-    n: usize,
-}
-
-impl Graph {
-    fn new() -> Self {
-        Self { parts: Vec::new(), n: 0 }
-    }
-    fn label(&mut self, prefix: &str) -> String {
-        self.n += 1;
-        format!("{prefix}{}", self.n)
-    }
-    fn push(&mut self, s: String) {
-        self.parts.push(s);
-    }
-    fn join(&self) -> String {
-        self.parts.join(";")
-    }
-}
-
-/// Builds the audio side of the render: the ordered list of source files to open and the
-/// filtergraph that trims, retimes, fades and mixes them.
-///
-/// Video is not in here any more. The picture is composited on the GPU and arrives at ffmpeg as
-/// raw frames on stdin, which is always input 0 — hence `first_input`, the index the first audio
-/// file gets on the command line.
-pub fn build_audio_graph(
-    project: &Project,
-    tl: &Timeline,
-    settings: &ExportSettings,
-    first_input: usize,
-) -> (Vec<PathBuf>, String, bool) {
-    let fps = settings.fps.max(1);
-    let mut inputs: Vec<PathBuf> = Vec::new();
-    let mut index_of: BTreeMap<MediaId, usize> = BTreeMap::new();
-    if settings.include_audio {
-        for track in tl.tracks.iter().filter(|t| !t.muted) {
-            for clip in &track.clips {
-                let Some(mid) = clip.media_id() else { continue };
-                let Some(m) = project.media(mid) else { continue };
-                if !m.has_audio || index_of.contains_key(&mid) {
-                    continue;
-                }
-                index_of.insert(mid, first_input + inputs.len());
-                inputs.push(m.path.clone());
-            }
-        }
-    }
-
-    let mut g = Graph::new();
-    let mut alabels: Vec<String> = Vec::new();
-    for track in tl.tracks.iter().filter(|t| !t.muted && settings.include_audio) {
-        for (i, clip) in track.clips.iter().enumerate() {
-            // If the next clip dissolves in, this one keeps rolling underneath for that long.
-            let tail = track
-                .clips
-                .get(i + 1)
-                .map(|n| n.transition_in.max(0))
-                .unwrap_or(0);
-            let Some(mid) = clip.media_id() else { continue };
-            let Some(m) = project.media(mid) else { continue };
-            if !m.has_audio {
-                continue;
-            }
-            let Some(&idx) = index_of.get(&mid) else { continue };
-            let speed = clip.speed.max(0.01) as f64;
-            let t0 = clip.start as f64 / fps as f64;
-            let src_in = clip.src_in as f64 / fps as f64;
-            let src_out = src_in + ((clip.len + tail) as f64 * speed / fps as f64);
-            let delay_ms = (t0 * 1000.0).round() as i64;
-            let lbl = g.label("a");
-            let mut chain = format!(
-                "[{idx}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS,\
-                 aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
-                f(src_in),
-                f(src_out)
-            );
-            for step in atempo_chain(speed) {
-                chain.push_str(&format!(",atempo={}", f(step)));
-            }
-            if (clip.volume - 1.0).abs() > 0.001 {
-                chain.push_str(&format!(",volume={:.4}", clip.volume));
-            }
-            if clip.fade_in > 0 {
-                chain.push_str(&format!(
-                    ",afade=t=in:st=0:d={}",
-                    f(clip.fade_in as f64 / fps as f64)
-                ));
-            }
-            let played = (clip.len + tail) as f64 / fps as f64;
-            if clip.fade_out > 0 {
-                let d = clip.fade_out as f64 / fps as f64;
-                chain.push_str(&format!(
-                    ",afade=t=out:st={}:d={}",
-                    f(played - tail as f64 / fps as f64 - d),
-                    f(d)
-                ));
-            }
-            if clip.transition_in > 0 {
-                let d = clip.transition_in as f64 / fps as f64;
-                chain.push_str(&format!(",afade=t=in:st=0:d={}", f(d)));
-            }
-            if tail > 0 {
-                let d = tail as f64 / fps as f64;
-                chain.push_str(&format!(",afade=t=out:st={}:d={}", f(played - d), f(d)));
-            }
-            if delay_ms > 0 {
-                chain.push_str(&format!(",adelay={delay_ms}|{delay_ms}"));
-            }
-            chain.push_str(&format!("[{lbl}]"));
-            g.push(chain);
-            alabels.push(lbl);
-        }
-    }
-
-    let has_audio = settings.include_audio && !alabels.is_empty();
-    if has_audio {
-        let joined: String = alabels.iter().map(|l| format!("[{l}]")).collect();
-        g.push(format!(
-            "{joined}amix=inputs={}:normalize=0:dropout_transition=0,\
-             alimiter=limit=0.97,aresample=48000[aout]",
-            alabels.len()
-        ));
-    }
-    (inputs, g.join(), has_audio)
-}
-
-/// ffmpeg's `atempo` only accepts 0.5–2.0 per instance, so larger speed changes are chained.
-fn atempo_chain(speed: f64) -> Vec<f64> {
-    if (speed - 1.0).abs() < 1e-6 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut remaining = speed.clamp(0.05, 20.0);
-    while remaining > 2.0 {
-        out.push(2.0);
-        remaining /= 2.0;
-    }
-    while remaining < 0.5 {
-        out.push(0.5);
-        remaining /= 0.5;
-    }
-    out.push(remaining);
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Full-resolution pictures for the render graph
 // ---------------------------------------------------------------------------
@@ -503,6 +295,73 @@ impl FrameSource for ExportFrames {
 }
 
 // ---------------------------------------------------------------------------
+// Sound for the mixer
+// ---------------------------------------------------------------------------
+
+/// Supplies the mixer with 48 kHz stereo samples for every media item the timeline uses.
+///
+/// The importer already writes exactly this file for anything brought into a project, so the
+/// usual case is a memory map of the same bytes the preview is mixing from — which is why the two
+/// paths can be compared sample by sample at all. A project rendered from the command line, or
+/// one whose cache has been cleared, may not have it, so anything missing is extracted here with
+/// the same ffmpeg invocation the importer uses.
+pub struct ExportPcm {
+    ffmpeg: PathBuf,
+    dir: PathBuf,
+    /// Source file and the importer's extracted PCM, if it wrote one.
+    media: BTreeMap<MediaId, (PathBuf, Option<PathBuf>)>,
+    opened: HashMap<MediaId, Option<Arc<memmap2::Mmap>>>,
+}
+
+impl ExportPcm {
+    pub fn new(tools: &Tools, project: &Project, dir: PathBuf) -> Self {
+        let mut media = BTreeMap::new();
+        for m in &project.media {
+            if m.has_audio {
+                media.insert(m.id, (m.path.clone(), m.audio_path.clone()));
+            }
+        }
+        Self { ffmpeg: tools.ffmpeg.clone(), dir, media, opened: HashMap::new() }
+    }
+
+    fn extract(&self, media: MediaId, src: &std::path::Path) -> Result<PathBuf> {
+        let out = self.dir.join(format!("audio{media}.pcm"));
+        let file = std::fs::File::create(&out)
+            .with_context(|| format!("creating {}", out.display()))?;
+        let status = ffmpeg::command(&self.ffmpeg)
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(src)
+            .args(["-vn", "-sn", "-dn", "-ac", "2", "-ar"])
+            .arg(crate::project::SAMPLE_RATE.to_string())
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-"])
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("extracting audio from {}", src.display()))?;
+        if !status.success() {
+            bail!("ffmpeg could not read the audio of {}", src.display());
+        }
+        Ok(out)
+    }
+}
+
+impl PcmSource for ExportPcm {
+    fn pcm(&mut self, media: MediaId) -> Option<Arc<memmap2::Mmap>> {
+        if let Some(v) = self.opened.get(&media) {
+            return v.clone();
+        }
+        let (src, cached) = self.media.get(&media)?.clone();
+        let path = match cached.filter(|p| p.is_file()) {
+            Some(p) => Some(p),
+            None => self.extract(media, &src).ok(),
+        };
+        let mapped = path.and_then(|p| crate::audio::open_pcm(&p));
+        self.opened.insert(media, mapped.clone());
+        mapped
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Running a render
 // ---------------------------------------------------------------------------
 
@@ -590,13 +449,35 @@ fn run_export(
         .context("preparing the render graph")?;
     let mut frames = ExportFrames::new(tools, project, fps);
 
-    let (audio_inputs, audio_graph, has_audio) = build_audio_graph(project, tl, settings, 1);
-
-    // The audio graph and any staging it needs live in their own directory, which is also
-    // ffmpeg's working directory, so nothing on the command line has to be escaped.
-    let staging = std::env::temp_dir().join(format!("kite-render-{}", std::process::id()));
+    // Everything the render needs to stage lives in its own directory.
+    let staging = std::env::temp_dir().join(format!(
+        "kite-render-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
     std::fs::create_dir_all(&staging).context("creating the render staging directory")?;
     let out_path = std::path::absolute(&settings.path).unwrap_or_else(|_| settings.path.clone());
+
+    // Sound is mixed first, whole, to a float WAV. Two live pipes into one ffmpeg — raw video on
+    // one and raw audio on the other — is a deadlock waiting to happen, and the mix is small
+    // next to the pictures, so this is the cheap way out rather than a compromise.
+    let (wav, plan) = if settings.include_audio {
+        let mut pcm = ExportPcm::new(tools, project, staging.clone());
+        let plan = plan_audio(project, tl, &mut pcm, &mut RetimeCache::default());
+        if plan.is_silent() {
+            (None, plan)
+        } else {
+            let path = staging.join("mix.wav");
+            write_mix(&plan, &path, total_frames, settings.fps)?;
+            (Some(path), plan)
+        }
+    } else {
+        (None, AudioPlan::default())
+    };
+    let has_audio = wav.is_some();
 
     let mut cmd = ffmpeg::command(&tools.ffmpeg);
     cmd.current_dir(&staging);
@@ -604,30 +485,12 @@ fn run_export(
     // Input 0 is us.
     cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba"]);
     cmd.args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "pipe:0"]);
-    for i in &audio_inputs {
-        cmd.arg("-i").arg(std::path::absolute(i).unwrap_or_else(|_| i.clone()));
-    }
-    if has_audio {
-        // Even an audio-only graph can outgrow a Windows command line on a heavily cut edit.
-        match graph_arg(tools) {
-            GraphArg::SlashFile => {
-                std::fs::write(staging.join("graph.txt"), audio_graph.as_bytes())
-                    .context("writing the audio filtergraph")?;
-                cmd.args(["-/filter_complex", "graph.txt"]);
-            }
-            GraphArg::ScriptFile => {
-                std::fs::write(staging.join("graph.txt"), audio_graph.as_bytes())
-                    .context("writing the audio filtergraph")?;
-                cmd.args(["-filter_complex_script", "graph.txt"]);
-            }
-            GraphArg::Inline => {
-                cmd.arg("-filter_complex").arg(&audio_graph);
-            }
-        }
+    if let Some(w) = &wav {
+        cmd.arg("-i").arg(w);
     }
     cmd.args(["-map", "0:v"]);
     if has_audio {
-        cmd.args(["-map", "[aout]"]);
+        cmd.args(["-map", "1:a"]);
     }
 
     let enc = settings.encoder;
@@ -651,7 +514,7 @@ fn run_export(
     cmd.args(["-g", &(fps * 2).to_string(), "-movflags", "+faststart"]);
     if has_audio {
         cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", settings.quality.audio_kbps())]);
-        // The mix is as long as the timeline; the picture decides when the file ends.
+        // The mix is exactly as long as the timeline; the picture decides when the file ends.
         cmd.args(["-shortest"]);
     }
     cmd.arg(&out_path);
@@ -736,5 +599,71 @@ fn run_export(
             "rendered {written} of {total_frames} frames before the encoder stopped"
         ));
     }
+
+    // A timeline that should have made a noise and a file that did not is the failure a tester
+    // reported and nobody could reproduce. It is no longer allowed to pass quietly.
+    if has_audio {
+        let probed = ffmpeg::probe(tools, &out_path)
+            .context("reading back the finished file to check its sound")?;
+        check_audio_arrived(plan.layers.len(), probed.has_audio)?;
+    }
     Ok(())
+}
+
+/// The last word on whether a render kept its sound.
+///
+/// Split out so it can be tested: a silent file from a timeline that had audio clips on it is the
+/// exact shape of the bug a tester reported and nobody could reproduce, and "the export succeeded"
+/// must never again be the whole story.
+fn check_audio_arrived(layers: usize, file_has_audio: bool) -> Result<()> {
+    if layers > 0 && !file_has_audio {
+        bail!(
+            "the timeline has {layers} audio clip(s) and a mix was written for them, but the \
+             rendered file has no sound track — the encoder dropped it"
+        );
+    }
+    Ok(())
+}
+
+/// Mixes the whole timeline to a float WAV.
+///
+/// The mix is generated by exactly the code the preview plays through, so what lands here is what
+/// was being monitored — not a second implementation that has to be kept in step by hand.
+fn write_mix(
+    plan: &AudioPlan,
+    path: &std::path::Path,
+    total_frames: i64,
+    fps: u32,
+) -> Result<()> {
+    // Match the picture exactly rather than trusting the plan's own idea of the length.
+    let total = (total_frames as i128 * crate::project::SAMPLE_RATE as i128
+        / fps.max(1) as i128) as i64;
+    let mut wav = WavWriter::create(path).context("creating the mixed audio file")?;
+    let mut scratch = Vec::new();
+    let mut block = vec![0f32; 8192 * 2];
+    let mut at = 0i64;
+    while at < total {
+        let n = ((total - at) as usize).min(8192);
+        plan.mix_into(at, &mut block[..n * 2], &mut scratch);
+        wav.write(&block[..n * 2]).context("writing the mixed audio")?;
+        at += n as i64;
+    }
+    let frames = wav.finish().context("finishing the mixed audio file")?;
+    if frames as i64 != total {
+        bail!("the mix came out {frames} samples long, expected {total}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_render_that_loses_its_sound_is_an_error() {
+        assert!(check_audio_arrived(3, false).is_err(), "silent output must not pass");
+        assert!(check_audio_arrived(3, true).is_ok());
+        // Nothing to lose is not a failure — a timeline of colour cards is legitimately silent.
+        assert!(check_audio_arrived(0, false).is_ok());
+    }
 }

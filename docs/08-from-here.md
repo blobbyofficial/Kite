@@ -90,10 +90,24 @@ The colour adjustment, the crossfade, the fades, the picture-in-picture transfor
 are each implemented once. Titles are rasterised with `ab_glyph` from the font egui already
 embeds, so they no longer depend on a system TrueType file being openable.
 
-*Exit criteria, met:* `parity_check` in `src/selftest.rs` renders the same timeline — a colour
-adjustment, a crossfade, a title and a scaled, offset picture-in-picture — through both paths and
-compares the pixels. Matching frames agree to about 4 levels per channel (proxy resampling plus
-the H.264 round trip); unrelated frames differ by 20, and the check fails if that margin closes.
+Sound went the same way. `src/mix.rs` holds an `AudioPlan` and one mixer; the preview's cpal
+callback and the export both execute it, and the export writes the result to a WAV that ffmpeg
+encodes. `amix`, `afade`, `adelay`, `atempo`, `volume` and `alimiter` are gone, and with them the
+last filtergraph — the export no longer passes ffmpeg a `-filter_complex` at all.
+
+*Exit criteria, met:* two checks in `src/selftest.rs`, built the same way.
+
+- `parity_check` renders one timeline — a colour adjustment, a crossfade, a title and a scaled,
+  offset picture-in-picture — through both paths and compares the pixels. Matching frames agree to
+  about 4 levels per channel (proxy resampling plus the H.264 round trip); unrelated frames differ
+  by 20.
+- `audio_parity_check` mixes one timeline — two clips at different volumes, a fade in, a fade out,
+  a crossfade, a clip that starts late and a clip at double speed — through both paths and compares
+  the samples. They agree to 0.0001 per sample against a 0.05 signal; unrelated audio differs by
+  0.057, five hundred times further apart.
+
+Both carry the same control, and both fail if that margin closes — so the tolerance cannot be
+quietly widened to make a drift go away.
 
 ### B. Real media I/O
 

@@ -8,6 +8,7 @@ mod export;
 mod ffmpeg;
 mod framestore;
 mod import;
+mod mix;
 mod project;
 mod proxy;
 mod render;

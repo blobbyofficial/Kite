@@ -1,9 +1,16 @@
-//! Real-time audio mixing and the transport clock.
+//! The preview's audio sink and the transport clock.
 //!
 //! Audio is the master clock: the output callback advances the playhead and video follows it.
 //! Doing it the other way round is what makes editors drift and click. The callback never
 //! allocates, never blocks on I/O, and holds a lock only long enough to clone an `Arc`.
+//!
+//! **No mixing happens here.** The callback asks `mix::AudioPlan` for a block of project samples
+//! and its only remaining job is to get them to the device — which is the same relationship
+//! `render.rs` has with the window. If a device will not run at 48 kHz the block is stepped
+//! through on the way out, and that step is the one thing the export does not do, because a file
+//! is always written at the project rate.
 
+use crate::mix::{AudioLayer, AudioPlan};
 use crate::project::SAMPLE_RATE;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use memmap2::Mmap;
@@ -11,60 +18,8 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// One audio clip flattened into playback-ready form: a memory-mapped PCM region plus the gain
-/// envelope, all in samples on the project timeline.
-#[derive(Clone)]
-pub struct AudioClip {
-    pub start: i64,
-    pub end: i64,
-    /// Sample offset into the source for the clip's first timeline sample.
-    pub src_offset: i64,
-    pub data: Arc<Mmap>,
-    pub volume: f32,
-    pub fade_in: i64,
-    pub fade_out: i64,
-}
-
-impl AudioClip {
-    #[inline]
-    fn gain_at(&self, t: i64) -> f32 {
-        let local = t - self.start;
-        let len = self.end - self.start;
-        let mut g = self.volume;
-        if self.fade_in > 0 && local < self.fade_in {
-            g *= local as f32 / self.fade_in as f32;
-        }
-        if self.fade_out > 0 && local > len - self.fade_out {
-            g *= ((len - local) as f32 / self.fade_out as f32).clamp(0.0, 1.0);
-        }
-        g
-    }
-
-    /// Interleaved stereo i16 sample pair at a source sample index.
-    #[inline]
-    fn sample(&self, i: i64) -> (f32, f32) {
-        if i < 0 {
-            return (0.0, 0.0);
-        }
-        let off = (i as usize) * 4;
-        let d: &[u8] = &self.data;
-        if off + 4 > d.len() {
-            return (0.0, 0.0);
-        }
-        let l = i16::from_le_bytes([d[off], d[off + 1]]) as f32 * (1.0 / 32768.0);
-        let r = i16::from_le_bytes([d[off + 2], d[off + 3]]) as f32 * (1.0 / 32768.0);
-        (l, r)
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct MixPlan {
-    pub clips: Vec<AudioClip>,
-    pub total: i64,
-}
-
 pub struct AudioEngine {
-    plan: Arc<Mutex<Arc<MixPlan>>>,
+    plan: Arc<Mutex<Arc<AudioPlan>>>,
     /// Playhead in project samples (48 kHz), written by the audio thread.
     position: Arc<AtomicI64>,
     playing: Arc<AtomicBool>,
@@ -80,7 +35,7 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new() -> Self {
-        let plan: Arc<Mutex<Arc<MixPlan>>> = Arc::new(Mutex::new(Arc::new(MixPlan::default())));
+        let plan: Arc<Mutex<Arc<AudioPlan>>> = Arc::new(Mutex::new(Arc::new(AudioPlan::default())));
         let position = Arc::new(AtomicI64::new(0));
         let playing = Arc::new(AtomicBool::new(false));
         let peak_l = Arc::new(AtomicU32::new(0));
@@ -114,7 +69,7 @@ impl AudioEngine {
         me
     }
 
-    pub fn set_plan(&self, plan: MixPlan) {
+    pub fn set_plan(&self, plan: AudioPlan) {
         *self.plan.lock() = Arc::new(plan);
     }
     pub fn position_samples(&self) -> i64 {
@@ -142,7 +97,7 @@ impl AudioEngine {
 }
 
 fn build_stream(
-    plan: Arc<Mutex<Arc<MixPlan>>>,
+    plan: Arc<Mutex<Arc<AudioPlan>>>,
     position: Arc<AtomicI64>,
     playing: Arc<AtomicBool>,
     peak_l: Arc<AtomicU32>,
@@ -184,8 +139,9 @@ fn build_stream(
     let fmt = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
-    let mut cursor = 0f64;
-    let mut active: Vec<AudioClip> = Vec::with_capacity(16);
+    let mut active: Vec<AudioLayer> = Vec::with_capacity(16);
+    // Mixed project samples, before they are stepped out to the device rate.
+    let mut block: Vec<f32> = Vec::with_capacity(8192);
 
     let err_fn = |e| eprintln!("audio stream error: {e}");
 
@@ -202,39 +158,24 @@ fn build_stream(
                         }
                         peak_l.store(0, Ordering::Relaxed);
                         peak_r.store(0, Ordering::Relaxed);
-                        cursor = position.load(Ordering::Relaxed) as f64;
                         return;
                     }
 
                     let plan = plan.lock().clone();
                     let start = position.load(Ordering::Relaxed);
-                    cursor = start as f64;
-                    let block_end = start + (frames as f64 * step).ceil() as i64 + 2;
-
-                    active.clear();
-                    for c in &plan.clips {
-                        if c.end > start && c.start < block_end {
-                            active.push(c.clone());
-                        }
+                    let need = (frames as f64 * step).ceil() as usize + 2;
+                    if block.len() < need * 2 {
+                        // Only ever grows, and only when the device changes its block size, so
+                        // steady-state playback still allocates nothing.
+                        block.resize(need * 2, 0.0);
                     }
+                    plan.mix_into(start, &mut block[..need * 2], &mut active);
 
                     let mut pk_l = 0f32;
                     let mut pk_r = 0f32;
                     for f in 0..frames {
-                        let t = (cursor + f as f64 * step) as i64;
-                        let mut l = 0f32;
-                        let mut r = 0f32;
-                        for c in active.iter() {
-                            if t >= c.start && t < c.end {
-                                let (sl, sr) = c.sample(c.src_offset + (t - c.start));
-                                let g = c.gain_at(t);
-                                l += sl * g;
-                                r += sr * g;
-                            }
-                        }
-                        // Soft clip rather than wrap, so an overloaded mix stays listenable.
-                        l = l.clamp(-1.0, 1.0);
-                        r = r.clamp(-1.0, 1.0);
+                        let i = ((f as f64 * step) as usize).min(need - 1) * 2;
+                        let (l, r) = (block[i], block[i + 1]);
                         pk_l = pk_l.max(l.abs());
                         pk_r = pk_r.max(r.abs());
                         let base = f * channels;

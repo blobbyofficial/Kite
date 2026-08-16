@@ -1,6 +1,7 @@
 //! Application state, transport, editing commands and the non-timeline panels.
 
-use crate::audio::{self, AudioClip, AudioEngine, MixPlan};
+use crate::audio::{self, AudioEngine};
+use crate::mix::{plan_audio, PcmSource, RetimeCache};
 use crate::decode::FrameCache;
 use crate::export::{self, Encoder, ExportJob, ExportMsg, ExportSettings, Quality};
 use crate::ffmpeg::Tools;
@@ -84,6 +85,17 @@ impl Preview {
                 Some(id)
             }
         }
+    }
+}
+
+/// Feeds the mixer from the PCM the importer already extracted and this session has mapped.
+struct MappedPcm<'a> {
+    pcm: &'a HashMap<MediaId, Arc<Mmap>>,
+}
+
+impl PcmSource for MappedPcm<'_> {
+    fn pcm(&mut self, media: MediaId) -> Option<Arc<Mmap>> {
+        self.pcm.get(&media).cloned()
     }
 }
 
@@ -185,6 +197,8 @@ pub struct App {
     thumbs: HashMap<(MediaId, u32), egui::TextureHandle>,
     thumb_order: Vec<(MediaId, u32)>,
     pcm: HashMap<MediaId, Arc<Mmap>>,
+    /// Stretched audio for retimed clips, kept so a plan rebuild on every edit does not redo it.
+    retimed: RetimeCache,
     peaks: HashMap<MediaId, Arc<Vec<(i16, i16)>>>,
     audio_dirty: bool,
 
@@ -286,6 +300,7 @@ impl App {
             thumbs: HashMap::new(),
             thumb_order: Vec::new(),
             pcm: HashMap::new(),
+            retimed: RetimeCache::default(),
             peaks: HashMap::new(),
             audio_dirty: true,
             export_job: None,
@@ -566,31 +581,17 @@ impl App {
         }
     }
 
-    /// Re-derives the audio mix plan from the document. Cheap enough to do on any edit.
+    /// Re-derives the audio plan from the document. Cheap enough to do on any edit — except
+    /// that a retimed clip is stretched while the plan is built, so this stays off the audio
+    /// thread and is only run when something actually changed.
     fn rebuild_audio_if_needed(&mut self) {
         if !self.audio_dirty {
             return;
         }
         self.audio_dirty = false;
-        let s = self.project.seq();
-        let mut clips = Vec::new();
-        for track in self.project.tracks().iter().filter(|t| !t.muted) {
-            for c in &track.clips {
-                let Some(mid) = c.media_id() else { continue };
-                let Some(data) = self.pcm.get(&mid) else { continue };
-                clips.push(AudioClip {
-                    start: s.frame_to_sample(c.start),
-                    end: s.frame_to_sample(c.end()),
-                    src_offset: s.frame_to_sample(c.src_in),
-                    data: data.clone(),
-                    volume: c.volume,
-                    fade_in: s.frame_to_sample(c.fade_in),
-                    fade_out: s.frame_to_sample(c.fade_out),
-                });
-            }
-        }
-        let total = s.frame_to_sample(self.project.duration());
-        self.audio.set_plan(MixPlan { clips, total });
+        let mut source = MappedPcm { pcm: &self.pcm };
+        let plan = plan_audio(&self.project, self.project.tl(), &mut source, &mut self.retimed);
+        self.audio.set_plan(plan);
     }
 
     // ------------------------------------------------------------ edit verbs
