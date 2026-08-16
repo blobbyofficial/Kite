@@ -79,12 +79,15 @@ pub struct ExportSettings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub include_audio: bool,
 }
 
 #[derive(Debug)]
 pub enum ExportMsg {
     Progress { pct: f32, frames: i64, speed: String },
-    Done(PathBuf),
+    /// Carries what the finished file actually contains, read back from the file itself rather
+    /// than assumed from what we asked for.
+    Done { path: PathBuf, width: u32, height: u32, duration: f64, has_audio: bool },
     Failed(String),
 }
 
@@ -98,6 +101,35 @@ impl ExportJob {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// What sound, if any, the current timeline would contribute to an export. Shown in the export
+/// dialog so "why is there no audio" is answered before rendering rather than after.
+pub fn audio_summary(project: &Project) -> (usize, usize, bool) {
+    let mut clips = 0;
+    let mut silent = 0;
+    let mut muted_track_has_audio = false;
+    for track in &project.tracks {
+        for c in &track.clips {
+            let has = c
+                .media_id()
+                .and_then(|m| project.media(m))
+                .map(|m| m.has_audio)
+                .unwrap_or(false);
+            if !has {
+                continue;
+            }
+            if track.muted {
+                muted_track_has_audio = true;
+                continue;
+            }
+            clips += 1;
+            if c.volume <= 0.0001 {
+                silent += 1;
+            }
+        }
+    }
+    (clips, silent, muted_track_has_audio)
 }
 
 /// Asks ffmpeg which encoders this build actually has, so we only offer ones that will work.
@@ -484,7 +516,7 @@ pub fn build_graph(
 
     // --- audio ---
     let mut alabels: Vec<String> = Vec::new();
-    for track in project.tracks.iter().filter(|t| !t.muted) {
+    for track in project.tracks.iter().filter(|t| !t.muted && settings.include_audio) {
         for (i, clip) in track.clips.iter().enumerate() {
             let tail = track
                 .clips
@@ -548,7 +580,7 @@ pub fn build_graph(
         }
     }
 
-    let has_audio = !alabels.is_empty();
+    let has_audio = settings.include_audio && !alabels.is_empty();
     if has_audio {
         let joined: String = alabels.iter().map(|l| format!("[{l}]")).collect();
         g.push(format!(
@@ -622,7 +654,15 @@ pub fn start(
                     if c2.load(Ordering::Relaxed) {
                         let _ = tx.send(ExportMsg::Failed("Export cancelled".into()));
                     } else {
-                        let _ = tx.send(ExportMsg::Done(s2.path.clone()));
+                        // Read the finished file back so what we report is what is really there.
+                        let probed = ffmpeg::probe(&tools, &s2.path).ok();
+                        let _ = tx.send(ExportMsg::Done {
+                            path: s2.path.clone(),
+                            width: probed.as_ref().map(|p| p.width).unwrap_or(s2.width),
+                            height: probed.as_ref().map(|p| p.height).unwrap_or(s2.height),
+                            duration: probed.as_ref().map(|p| p.duration).unwrap_or(0.0),
+                            has_audio: probed.as_ref().map(|p| p.has_audio).unwrap_or(false),
+                        });
                     }
                 }
                 Err(e) => {

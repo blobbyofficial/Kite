@@ -9,6 +9,7 @@ mod ffmpeg;
 mod framestore;
 mod import;
 mod project;
+mod proxy;
 mod selftest;
 mod theme;
 mod timeline;
@@ -36,6 +37,24 @@ fn main() -> eframe::Result<()> {
             std::process::exit(1);
         }
     };
+
+    // Renders a project file without opening a window. Useful for batch work, and it is how a
+    // reported export problem gets reproduced exactly rather than approximately.
+    if let Some(i) = args.iter().position(|a| a == "--export") {
+        let project = args.get(i + 1).cloned();
+        let out = args.get(i + 2).cloned();
+        let (Some(project), Some(out)) = (project, out) else {
+            eprintln!("usage: kite --export <project.kite> <output.mp4>");
+            std::process::exit(2);
+        };
+        return match selftest::export_cli(tools, &project, &out) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("export failed: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     if args.iter().any(|a| a == "--selftest") {
         return match selftest::run(tools) {

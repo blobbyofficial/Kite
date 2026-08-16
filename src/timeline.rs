@@ -33,56 +33,66 @@ pub fn panel(app: &mut App, ctx: &Context) {
         });
 }
 
+/// Editing actions on the left, view controls on the right.
+///
+/// The first version put everything in one flat row — cutting tools, view toggles and "add track"
+/// side by side — which made it impossible to find anything by category.
 fn toolbar(app: &mut App, ui: &mut egui::Ui) {
+    let has_sel = app.project.tracks.iter().any(|t| t.clips.iter().any(|c| c.selected));
     ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        if ui.button("✂ Split").on_hover_text("Split at playhead (S)").clicked() {
+        ui.add_space(2.0);
+        if ui.button("Split").on_hover_text("Cut every clip at the playhead   S").clicked() {
             app.split_at_playhead();
         }
-        if ui.button("🗑 Delete").on_hover_text("Delete selected (Del)").clicked() {
+        if ui
+            .add_enabled(has_sel, egui::Button::new("Delete"))
+            .on_hover_text("Remove the selection, leaving a gap   Del")
+            .clicked()
+        {
             app.delete_selected(false);
         }
         if ui
-            .button("⏴⏵ Ripple")
-            .on_hover_text("Delete and close the gap (Shift+Del)")
+            .add_enabled(has_sel, egui::Button::new("Ripple"))
+            .on_hover_text("Remove the selection and close the gap   Shift+Del")
             .clicked()
         {
             app.delete_selected(true);
         }
-        ui.separator();
-        if ui.button("T Text").on_hover_text("Add a title at the playhead").clicked() {
-            app.add_text_clip();
-        }
         if ui
-            .button("⧗ Crossfade")
-            .on_hover_text("Dissolve the selected clip from the one before it (Ctrl+T)")
+            .add_enabled(has_sel, egui::Button::new("Crossfade"))
+            .on_hover_text("Dissolve into the selection from the clip before it   Ctrl+T")
             .clicked()
         {
             let half = (app.fps() as i64 / 2).max(1);
             app.crossfade_selected(half);
         }
+
+        ui.add_space(6.0);
         ui.separator();
-        ui.checkbox(&mut app.snap, "Snap").on_hover_text("Toggle with M");
-        ui.checkbox(&mut app.follow, "Follow");
-        ui.separator();
-        if ui.button("−").on_hover_text("Zoom out (−)").clicked() {
-            app.px_per_frame = (app.px_per_frame / 1.35).max(0.02);
+        ui.add_space(6.0);
+        if ui.button("Title").on_hover_text("Add a title at the playhead").clicked() {
+            app.add_text_clip();
         }
-        if ui.button("+").on_hover_text("Zoom in (+)").clicked() {
-            app.px_per_frame = (app.px_per_frame * 1.35).min(80.0);
-        }
-        if ui.button("Fit").on_hover_text("Zoom so the whole sequence is visible").clicked() {
-            fit_to_window(app);
-        }
-        ui.separator();
-        if ui.button("+ Video track").clicked() {
-            app.snapshot();
-            app.project.add_track(TrackKind::Video);
-        }
-        if ui.button("+ Audio track").clicked() {
-            app.snapshot();
-            app.project.add_track(TrackKind::Audio);
-        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(2.0);
+            if ui.button("Fit").on_hover_text("Zoom so the whole sequence fits").clicked() {
+                fit_to_window(app);
+            }
+            if ui.button("+").on_hover_text("Zoom in   +").clicked() {
+                app.px_per_frame = (app.px_per_frame * 1.35).min(80.0);
+            }
+            if ui.button("−").on_hover_text("Zoom out   −").clicked() {
+                app.px_per_frame = (app.px_per_frame / 1.35).max(0.02);
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.checkbox(&mut app.follow, "Follow")
+                .on_hover_text("Keep the playhead in view while playing");
+            ui.checkbox(&mut app.snap, "Snap")
+                .on_hover_text("Snap edits to clip edges and the playhead   M");
+        });
     });
 }
 
@@ -266,6 +276,29 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
         );
     }
 
+    // "Add track" belongs with the tracks, not in the clip-editing toolbar.
+    let add_y = y + 4.0;
+    if add_y + 22.0 < rect.bottom() {
+        let br = Rect::from_min_size(Pos2::new(head_rect.left() + 10.0, add_y), Vec2::new(108.0, 20.0));
+        let resp = ui.interact(br, ui.id().with("addtrack"), Sense::click());
+        painter.rect_filled(
+            br,
+            CornerRadius::same(3),
+            if resp.hovered() { theme::RAISED } else { theme::PANEL },
+        );
+        painter.rect_stroke(br, CornerRadius::same(3), Stroke::new(1.0, theme::LINE), StrokeKind::Inside);
+        painter.text(
+            br.center(),
+            Align2::CENTER_CENTER,
+            "+ Add track",
+            theme::ui_font(11.0),
+            theme::TEXT_DIM,
+        );
+        if resp.clicked() {
+            app.show_add_track = true;
+        }
+    }
+
     if max_scroll_y > 0.0 {
         let frac = (tracks_rect.height() / content_h).clamp(0.05, 1.0);
         let bar_h = tracks_rect.height() * frac;
@@ -370,66 +403,147 @@ fn draw_ruler(app: &mut App, ui: &mut egui::Ui, painter: &egui::Painter, r: Rect
 
 fn draw_track_header(app: &mut App, ui: &mut egui::Ui, tid: TrackId, r: Rect) {
     let painter = ui.painter_at(r);
-    painter.rect_filled(r, CornerRadius::ZERO, theme::PANEL_HI);
+    let Some(track) = app.project.track(tid) else { return };
+    let (name, kind, muted, hidden, locked, height) =
+        (track.name.clone(), track.kind, track.muted, track.hidden, track.locked, track.height);
+
+    let bg = if muted || hidden { theme::PANEL } else { theme::PANEL_HI };
+    painter.rect_filled(r, CornerRadius::ZERO, bg);
     painter.line_segment(
         [Pos2::new(r.right(), r.top()), Pos2::new(r.right(), r.bottom())],
         Stroke::new(1.0, theme::LINE),
     );
-    let Some(track) = app.project.track(tid) else { return };
-    let name = track.name.clone();
-    let kind = track.kind;
-    let muted = track.muted;
-    let hidden = track.hidden;
-    let locked = track.locked;
-
-    painter.text(
-        Pos2::new(r.left() + 8.0, r.top() + 6.0),
-        Align2::LEFT_TOP,
-        &name,
-        theme::ui_font(12.0),
-        theme::TEXT,
+    // A colour flash keyed to the track kind, so video and audio lanes read apart at a glance.
+    let flash = if kind == TrackKind::Video { theme::VIDEO_CLIP_HI } else { theme::AUDIO_CLIP_HI };
+    painter.rect_filled(
+        Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
+        CornerRadius::ZERO,
+        if muted || hidden { flash.gamma_multiply(0.35) } else { flash },
     );
 
-    let mut x = r.left() + 8.0;
-    let by = r.top() + 24.0;
-    let bs = Vec2::new(22.0, 18.0);
+    painter.text(
+        Pos2::new(r.left() + 12.0, r.top() + 8.0),
+        Align2::LEFT_TOP,
+        &name,
+        theme::ui_font(12.5),
+        if muted || hidden { theme::TEXT_FAINT } else { theme::TEXT },
+    );
+
+    // Toggles sit on a second line so they never collide with the name on a short track.
+    let bs = Vec2::new(26.0, 18.0);
+    let by = r.top() + 26.0;
+    let mut x = r.left() + 11.0;
+    let mut action: Option<u8> = None;
+
     let mut toggle = |ui: &mut egui::Ui, label: &str, on: bool, x: &mut f32, hint: &str| -> bool {
         let br = Rect::from_min_size(Pos2::new(*x, by), bs);
-        *x += bs.x + 4.0;
-        if br.bottom() > r.bottom() {
+        *x += bs.x + 5.0;
+        if br.bottom() > r.bottom() - 2.0 {
             return false;
         }
         let resp = ui.interact(br, ui.id().with((tid, label)), Sense::click());
-        let bg = if on { theme::ACCENT_DIM } else { theme::PANEL };
-        ui.painter().rect_filled(br, CornerRadius::same(3), bg);
-        ui.painter().text(
-            br.center(),
-            Align2::CENTER_CENTER,
-            label,
-            theme::ui_font(10.0),
-            if on { theme::TEXT } else { theme::TEXT_DIM },
+        let (fill, fg) = if on {
+            (theme::ACCENT_DIM, theme::ACCENT)
+        } else if resp.hovered() {
+            (theme::RAISED, theme::TEXT)
+        } else {
+            (theme::PANEL, theme::TEXT_DIM)
+        };
+        ui.painter().rect_filled(br, CornerRadius::same(3), fill);
+        ui.painter().rect_stroke(
+            br,
+            CornerRadius::same(3),
+            Stroke::new(1.0, if on { theme::ACCENT } else { theme::LINE }),
+            StrokeKind::Inside,
         );
+        ui.painter()
+            .text(br.center(), Align2::CENTER_CENTER, label, theme::mono(10.0), fg);
         resp.on_hover_text(hint).clicked()
     };
 
-    let mut changed = None;
-    if toggle(ui, "M", muted, &mut x, "Mute this track") {
-        changed = Some(0);
+    if toggle(ui, "M", muted, &mut x, "Mute — leave this track out of playback and export") {
+        action = Some(0);
     }
-    if kind == TrackKind::Video && toggle(ui, "👁", hidden, &mut x, "Hide this track") {
-        changed = Some(1);
+    if kind == TrackKind::Video && toggle(ui, "H", hidden, &mut x, "Hide the picture on this track")
+    {
+        action = Some(1);
     }
-    if toggle(ui, "🔒", locked, &mut x, "Lock this track") {
-        changed = Some(2);
+    if toggle(ui, "L", locked, &mut x, "Lock — stop edits on this track") {
+        action = Some(2);
     }
-    if let Some(w) = changed {
-        app.snapshot();
-        if let Some(t) = app.project.track_mut(tid) {
-            match w {
-                0 => t.muted = !t.muted,
-                1 => t.hidden = !t.hidden,
-                _ => t.locked = !t.locked,
+    if toggle(ui, "▼", false, &mut x, "Track options") {
+        action = Some(3);
+    }
+
+    match action {
+        Some(0) | Some(1) | Some(2) => {
+            app.snapshot();
+            if let Some(t) = app.project.track_mut(tid) {
+                match action {
+                    Some(0) => t.muted = !t.muted,
+                    Some(1) => t.hidden = !t.hidden,
+                    _ => t.locked = !t.locked,
+                }
             }
+        }
+        Some(3) => app.track_menu = Some(tid),
+        _ => {}
+    }
+
+    // The options menu, opened from the ▼ button and also by right-clicking the header.
+    let menu_resp = ui.interact(r, ui.id().with(("hdr", tid)), Sense::click());
+    if menu_resp.secondary_clicked() {
+        app.track_menu = Some(tid);
+    }
+    if app.track_menu == Some(tid) {
+        let mut open = true;
+        egui::Window::new(format!("Track  {name}"))
+            .id(ui.id().with(("trackmenu", tid)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_pos(Pos2::new(r.left() + 8.0, r.bottom() + 4.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(190.0);
+                let mut nm = name.clone();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut nm).hint_text("Track name"))
+                    .changed()
+                {
+                    if let Some(t) = app.project.track_mut(tid) {
+                        t.name = nm;
+                    }
+                    app.mark_audio_dirty();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Height").color(theme::TEXT_DIM));
+                    if ui.small_button("−").clicked() {
+                        app.set_track_height(tid, height - 16.0);
+                    }
+                    if ui.small_button("+").clicked() {
+                        app.set_track_height(tid, height + 16.0);
+                    }
+                });
+                ui.separator();
+                if ui.button("Add video track").clicked() {
+                    app.add_track(TrackKind::Video);
+                    app.track_menu = None;
+                }
+                if ui.button("Add audio track").clicked() {
+                    app.add_track(TrackKind::Audio);
+                    app.track_menu = None;
+                }
+                ui.separator();
+                if ui
+                    .button(egui::RichText::new("Delete this track").color(theme::BAD))
+                    .clicked()
+                {
+                    app.delete_track(tid);
+                    app.track_menu = None;
+                }
+            });
+        if !open {
+            app.track_menu = None;
         }
     }
 }

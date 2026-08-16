@@ -6,10 +6,10 @@
 
 use crate::framestore::FrameStore;
 use crate::project::MediaId;
+use crate::proxy::{segment_of, ProxyBuilder, SegmentState, SEG_FRAMES};
 use crossbeam_channel::{Sender, TrySendError};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use zune_jpeg::zune_core::bytestream::ZCursor;
@@ -93,8 +93,12 @@ struct PrefetchReq {
 }
 
 pub struct FrameCache {
-    stores: Mutex<HashMap<MediaId, Arc<FrameStore>>>,
-    paths: Mutex<HashMap<MediaId, PathBuf>>,
+    /// One open store per built span, not per media item.
+    stores: Mutex<HashMap<(MediaId, i64), Arc<FrameStore>>>,
+    /// The most recent frame we managed to show for each item, so the picture holds steady while
+    /// a span is still being prepared instead of dropping to black.
+    last_good: Mutex<HashMap<MediaId, u32>>,
+    pub builder: Arc<ProxyBuilder>,
     lru: Arc<Mutex<Lru>>,
     tx: Sender<PrefetchReq>,
     /// Bumped whenever the playhead jumps, so stale prefetch work can be abandoned.
@@ -103,14 +107,15 @@ pub struct FrameCache {
 }
 
 impl FrameCache {
-    pub fn new(cache_bytes: usize, workers: usize) -> Arc<Self> {
+    pub fn new(cache_bytes: usize, workers: usize, builder: Arc<ProxyBuilder>) -> Arc<Self> {
         let (tx, rx) = crossbeam_channel::bounded::<PrefetchReq>(64);
         let lru = Arc::new(Mutex::new(Lru::new(cache_bytes)));
         let generation = Arc::new(AtomicU64::new(0));
 
         let me = Arc::new(Self {
             stores: Mutex::new(HashMap::new()),
-            paths: Mutex::new(HashMap::new()),
+            last_good: Mutex::new(HashMap::new()),
+            builder,
             lru: lru.clone(),
             tx,
             generation: generation.clone(),
@@ -134,6 +139,8 @@ impl FrameCache {
                             if cache.lru.lock().peek(&(req.media, f)).is_some() {
                                 continue;
                             }
+                            // Warm the span that is coming up as well as the frames themselves.
+                            cache.builder.request(req.media, segment_of(f as i64), false);
                             let _ = cache.decode_into_cache(req.media, f);
                         }
                     }
@@ -143,28 +150,38 @@ impl FrameCache {
         me
     }
 
-    pub fn register(&self, media: MediaId, proxy: PathBuf) {
-        self.paths.lock().insert(media, proxy);
-    }
-
     pub fn forget(&self, media: MediaId) {
-        self.paths.lock().remove(&media);
-        self.stores.lock().remove(&media);
+        self.builder.forget(media);
+        self.stores.lock().retain(|(m, _), _| *m != media);
+        self.last_good.lock().remove(&media);
         self.lru.lock().drop_media(media);
     }
 
-    fn store(&self, media: MediaId) -> Option<Arc<FrameStore>> {
-        if let Some(s) = self.stores.lock().get(&media) {
+    /// Opens the span containing `frame`, if it has been built.
+    fn store_for(&self, media: MediaId, frame: i64) -> Option<Arc<FrameStore>> {
+        let seg = segment_of(frame);
+        if let Some(s) = self.stores.lock().get(&(media, seg)) {
             return Some(s.clone());
         }
-        let path = self.paths.lock().get(&media)?.clone();
+        let src = self.builder.source(media)?;
+        let path = src.segment_path(seg);
+        if !path.is_file() {
+            return None;
+        }
         let s = Arc::new(FrameStore::open(&path).ok()?);
-        self.stores.lock().insert(media, s.clone());
+        self.stores.lock().insert((media, seg), s.clone());
         Some(s)
     }
 
-    pub fn frame_count(&self, media: MediaId) -> Option<u32> {
-        self.store(media).map(|s| s.frames as u32)
+    /// Whether the span holding this frame is ready, being built, or not started.
+    pub fn segment_state(&self, media: MediaId, frame: u32) -> SegmentState {
+        self.builder.state(media, segment_of(frame as i64))
+    }
+
+    /// The last frame shown for this item, used to hold the picture while a span builds.
+    pub fn last_good(&self, media: MediaId) -> Option<Arc<DecodedFrame>> {
+        let f = *self.last_good.lock().get(&media)?;
+        self.lru.lock().peek(&(media, f))
     }
 
     /// Cache-only lookup. Used when we would rather show a slightly stale frame than block.
@@ -175,17 +192,33 @@ impl FrameCache {
     /// Returns the frame, decoding it on the calling thread if it is not cached.
     pub fn get(&self, media: MediaId, frame: u32) -> Option<Arc<DecodedFrame>> {
         if let Some(f) = self.lru.lock().get(&(media, frame)) {
+            self.last_good.lock().insert(media, frame);
             return Some(f);
         }
         self.decode_into_cache(media, frame)
     }
 
+    /// The frame if it is available, otherwise the most recent one we did manage to show.
+    pub fn get_or_last(&self, media: MediaId, frame: u32) -> Option<Arc<DecodedFrame>> {
+        self.get(media, frame).or_else(|| self.last_good(media))
+    }
+
     fn decode_into_cache(&self, media: MediaId, frame: u32) -> Option<Arc<DecodedFrame>> {
-        let store = self.store(media)?;
-        let jpeg = store.jpeg(frame as usize)?;
+        let f = frame as i64;
+        let store = match self.store_for(media, f) {
+            Some(s) => s,
+            None => {
+                // Not built yet: ask for it and let the caller show the previous frame.
+                self.builder.request(media, segment_of(f), true);
+                return None;
+            }
+        };
+        let local = (f % SEG_FRAMES) as usize;
+        let jpeg = store.jpeg(local)?;
         let decoded = decode_jpeg_rgba(jpeg)?;
         let arc = Arc::new(decoded);
         self.lru.lock().insert((media, frame), arc.clone());
+        self.last_good.lock().insert(media, frame);
         self.decoded_this_session.fetch_add(1, Ordering::Relaxed);
         Some(arc)
     }

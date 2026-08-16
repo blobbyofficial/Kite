@@ -75,8 +75,6 @@ pub struct MediaItem {
     pub src_fps: f64,
     pub has_video: bool,
     pub has_audio: bool,
-    /// Our indexed all-intra frame store. Random access is an offset lookup.
-    pub proxy_path: Option<PathBuf>,
     /// Interleaved stereo i16 at 48 kHz, memory-mapped at playback time.
     pub audio_path: Option<PathBuf>,
     /// Precomputed min/max envelope for instant waveform drawing.

@@ -5,6 +5,7 @@ use crate::decode::FrameCache;
 use crate::export::{self, Encoder, ExportJob, ExportMsg, ExportSettings, Quality};
 use crate::ffmpeg::Tools;
 use crate::import::{ImportMsg, Importer};
+use crate::proxy::{ProxyBuilder, ProxySource};
 use crate::project::{
     timecode, Clip, ClipId, ClipSource, ColorAdjust, History, ImportState, MediaId, MediaItem,
     Project, TextProps, Track, TrackId, TrackKind, VideoSettings,
@@ -34,6 +35,23 @@ struct TexSlot {
     key: u64,
 }
 
+/// The sequence a new project will be created with.
+#[derive(Clone)]
+pub struct NewProject {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Take the sequence from the first clip you add instead of fixing it now.
+    pub from_first_clip: bool,
+}
+
+impl Default for NewProject {
+    fn default() -> Self {
+        Self { name: "My video".into(), width: 1920, height: 1080, fps: 30, from_first_clip: true }
+    }
+}
+
 pub struct DragState {
     pub kind: DragKind,
     pub clip: ClipId,
@@ -58,6 +76,7 @@ pub struct App {
     pub tools: Arc<Tools>,
     pub importer: Importer,
     pub cache: Arc<FrameCache>,
+    pub proxy: Arc<ProxyBuilder>,
     pub audio: AudioEngine,
 
     pub playhead: i64,
@@ -73,6 +92,8 @@ pub struct App {
     pub snap: bool,
     pub follow: bool,
     pub proxy_height: u32,
+    /// False until the sequence has been fixed, either explicitly or by the first clip added.
+    pub sequence_locked: bool,
 
     pub drag: Option<DragState>,
     pub scrubbing: bool,
@@ -94,6 +115,10 @@ pub struct App {
     pub encoders: Vec<Encoder>,
 
     pub show_shortcuts: bool,
+    pub track_menu: Option<TrackId>,
+    pub show_add_track: bool,
+    pub show_new_project: bool,
+    pub new_proj: NewProject,
     pub toast: Option<(String, Instant, bool)>,
     pub selected_media: Option<MediaId>,
     clipboard: Vec<(usize, Clip)>,
@@ -121,8 +146,9 @@ impl App {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
         let importer = Importer::new(tools.clone(), cache_dir, (cores / 2).clamp(1, 4));
+        let proxy = ProxyBuilder::new(tools.clone(), (cores / 2).clamp(1, 3));
         // Roughly a quarter of a small machine's RAM budget, capped so we never page.
-        let cache = FrameCache::new(384 * 1024 * 1024, (cores / 2).clamp(1, 3));
+        let cache = FrameCache::new(384 * 1024 * 1024, (cores / 2).clamp(1, 3), proxy.clone());
         let encoders = export::available_encoders(&tools);
 
         let project = Project::default();
@@ -133,6 +159,7 @@ impl App {
             width: project.settings.width,
             height: project.settings.height,
             fps: project.settings.fps,
+            include_audio: true,
         };
 
         let mut me = Self {
@@ -143,6 +170,7 @@ impl App {
             tools,
             importer,
             cache,
+            proxy,
             audio: AudioEngine::new(),
             playhead: 0,
             playing: false,
@@ -155,6 +183,7 @@ impl App {
             snap: true,
             follow: true,
             proxy_height: 540,
+            sequence_locked: false,
             drag: None,
             scrubbing: false,
             tex: Vec::new(),
@@ -171,6 +200,10 @@ impl App {
             export_settings,
             encoders,
             show_shortcuts: false,
+            track_menu: None,
+            show_add_track: false,
+            show_new_project: false,
+            new_proj: NewProject::default(),
             toast: None,
             selected_media: None,
             clipboard: Vec::new(),
@@ -187,6 +220,8 @@ impl App {
             let a = autosave_path();
             if a.is_file() {
                 me.recovery = Some(a);
+            } else {
+                me.show_new_project = true;
             }
         }
         me
@@ -328,14 +363,13 @@ impl App {
                 src_fps: 0.0,
                 has_video: false,
                 has_audio: false,
-                proxy_path: None,
                 audio_path: None,
                 peaks_path: None,
                 state: ImportState::Queued,
                 error: None,
             });
             self.importer
-                .submit(id, path, self.project.settings, self.proxy_height);
+                .submit(id, path, self.project.settings.fps, self.proxy_height);
             n += 1;
         }
         if n > 0 {
@@ -348,7 +382,8 @@ impl App {
         let msgs: Vec<ImportMsg> = self.importer.rx.try_iter().collect();
         for msg in msgs {
             match msg {
-                ImportMsg::Probed { id, info, frames } => {
+                ImportMsg::Probed { id, info, frames, video_dir } => {
+                    let path = self.project.media(id).map(|m| m.path.clone());
                     if let Some(m) = self.project.media_mut(id) {
                         m.duration = info.duration;
                         m.frames = frames;
@@ -357,42 +392,57 @@ impl App {
                         m.src_fps = info.fps;
                         m.has_video = info.has_video;
                         m.has_audio = info.has_audio;
-                        m.state = ImportState::Building(0);
-                    }
-                }
-                ImportMsg::Progress { id, pct } => {
-                    if let Some(m) = self.project.media_mut(id) {
-                        m.state = ImportState::Building(pct);
-                    }
-                }
-                ImportMsg::Ready { id, proxy, audio: apath, peaks, frames } => {
-                    if let Some(m) = self.project.media_mut(id) {
-                        m.proxy_path = proxy.clone();
-                        m.audio_path = apath.clone();
-                        m.peaks_path = peaks.clone();
-                        m.frames = frames;
+                        // Editable immediately; the picture fills in as spans are built.
                         m.state = ImportState::Ready;
                     }
-                    if let Some(p) = proxy {
-                        self.cache.register(id, p);
+                    if !self.sequence_locked
+                        && info.has_video
+                        && info.width > 0
+                        && self.project.tracks.iter().all(|t| t.clips.is_empty())
+                    {
+                        let fps = if info.fps > 1.0 { info.fps.round() as u32 } else { 30 };
+                        let s = VideoSettings { width: info.width, height: info.height, fps };
+                        self.project.settings = s;
+                        self.export_settings.width = s.width;
+                        self.export_settings.height = s.height;
+                        self.export_settings.fps = s.fps;
+                        self.sequence_locked = true;
+                        self.notify(format!(
+                            "Sequence set to {}×{} at {} fps to match your footage",
+                            s.width, s.height, s.fps
+                        ));
                     }
-                    if let Some(p) = apath {
-                        if let Some(map) = audio::open_pcm(&p) {
-                            self.pcm.insert(id, map);
-                        }
-                    }
-                    if let Some(p) = peaks {
-                        if let Some(v) = audio::load_peaks(&p) {
-                            self.peaks.insert(id, v);
+                    if info.has_video {
+                        if let Some(path) = path {
+                            self.proxy.register(ProxySource {
+                                media: id,
+                                path,
+                                dir: video_dir,
+                                fps: self.project.settings.fps,
+                                height: self.proxy_height,
+                                total_frames: frames.max(1),
+                            });
                         }
                     }
                     self.audio_dirty = true;
-                    let name = self
-                        .project
-                        .media(id)
-                        .map(|m| m.name.clone())
-                        .unwrap_or_default();
+                    if self.selected_media.is_none() {
+                        self.selected_media = Some(id);
+                    }
+                    let name = self.project.media(id).map(|m| m.name.clone()).unwrap_or_default();
                     self.notify(format!("{name} ready"));
+                }
+                ImportMsg::AudioReady { id, audio: apath, peaks } => {
+                    if let Some(map) = audio::open_pcm(&apath) {
+                        self.pcm.insert(id, map);
+                    }
+                    if let Some(v) = audio::load_peaks(&peaks) {
+                        self.peaks.insert(id, v);
+                    }
+                    if let Some(m) = self.project.media_mut(id) {
+                        m.audio_path = Some(apath);
+                        m.peaks_path = Some(peaks);
+                    }
+                    self.audio_dirty = true;
                 }
                 ImportMsg::Failed { id, error } => {
                     let name = self
@@ -852,6 +902,35 @@ impl App {
         }
     }
 
+    pub fn delete_track(&mut self, tid: TrackId) {
+        let kind = self.project.track(tid).map(|t| t.kind);
+        let remaining = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| Some(t.kind) == kind)
+            .count();
+        if remaining <= 1 {
+            self.warn("A project needs at least one track of each kind");
+            return;
+        }
+        self.snapshot();
+        self.project.tracks.retain(|t| t.id != tid);
+        self.notify("Track removed");
+    }
+
+    pub fn set_track_height(&mut self, tid: TrackId, h: f32) {
+        if let Some(t) = self.project.track_mut(tid) {
+            t.height = h.clamp(38.0, 220.0);
+        }
+        self.dirty = true;
+    }
+
+    pub fn add_track(&mut self, kind: TrackKind) {
+        self.snapshot();
+        self.project.add_track(kind);
+    }
+
     pub fn select_all(&mut self) {
         for t in &mut self.project.tracks {
             for c in &mut t.clips {
@@ -1046,13 +1125,37 @@ impl App {
             if let Some(m) = self.project.media_mut(id) {
                 m.state = ImportState::Queued;
             }
-            self.importer.submit(id, path, settings, ph);
+            self.importer.submit(id, path, settings.fps, ph);
         }
     }
 
     // ------------------------------------------------------------ persistence
 
+    /// Applies the start dialog and begins a clean project.
+    pub fn create_project(&mut self) {
+        let d = self.new_proj.clone();
+        self.project = Project::default();
+        self.project.name = if d.name.trim().is_empty() { "Untitled".into() } else { d.name.clone() };
+        if !d.from_first_clip {
+            self.project.settings.width = d.width;
+            self.project.settings.height = d.height;
+            self.project.settings.fps = d.fps;
+        }
+        self.sequence_locked = !d.from_first_clip;
+        self.history = History::default();
+        self.project_path = None;
+        self.playhead = 0;
+        self.dirty = false;
+        self.audio_dirty = true;
+        self.show_new_project = false;
+        self.export_settings.width = self.project.settings.width;
+        self.export_settings.height = self.project.settings.height;
+        self.export_settings.fps = self.project.settings.fps;
+    }
+
     pub fn new_project(&mut self) {
+        self.show_new_project = true;
+        self.new_proj = NewProject::default();
         self.project = Project::default();
         self.history = History::default();
         self.project_path = None;
@@ -1112,33 +1215,16 @@ impl App {
                 // Re-attach derived media; anything missing is rebuilt in the background.
                 let items: Vec<MediaItem> = self.project.media.clone();
                 for m in items {
-                    let ready = m
-                        .proxy_path
-                        .as_ref()
-                        .map(|p| p.is_file())
-                        .unwrap_or(!m.has_video);
-                    if ready {
-                        if let Some(p) = &m.proxy_path {
-                            self.cache.register(m.id, p.clone());
-                        }
-                        if let Some(p) = &m.audio_path {
-                            if let Some(map) = audio::open_pcm(p) {
-                                self.pcm.insert(m.id, map);
-                            }
-                        }
-                        if let Some(p) = &m.peaks_path {
-                            if let Some(v) = audio::load_peaks(p) {
-                                self.peaks.insert(m.id, v);
-                            }
-                        }
-                    } else if m.path.is_file() {
+                    if m.path.is_file() {
                         if let Some(item) = self.project.media_mut(m.id) {
                             item.state = ImportState::Queued;
                         }
+                        // Re-probing is quick and everything derived from it is cached, so this
+                        // costs little and cannot disagree with what is actually on disk.
                         self.importer.submit(
                             m.id,
                             m.path.clone(),
-                            self.project.settings,
+                            self.project.settings.fps,
                             self.proxy_height,
                         );
                     } else if let Some(item) = self.project.media_mut(m.id) {
@@ -1197,12 +1283,22 @@ impl App {
                         timecode(self.duration(), self.fps())
                     );
                 }
-                ExportMsg::Done(path) => {
+                ExportMsg::Done { path, width, height, duration, has_audio } => {
                     self.export_job = None;
                     self.export_pct = 100.0;
-                    let p = path.clone();
-                    self.notify(format!("Exported to {}", p.display()));
-                    reveal(&p);
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let sound = if has_audio { "with sound" } else { "NO SOUND" };
+                    let msg = format!("Exported {name} — {width}×{height}, {duration:.1}s, {sound}");
+                    if has_audio {
+                        self.notify(msg);
+                    } else {
+                        // Saying this loudly beats letting it be discovered on upload.
+                        self.warn(msg);
+                    }
+                    reveal(&path);
                 }
                 ExportMsg::Failed(e) => {
                     self.export_job = None;
@@ -1370,6 +1466,7 @@ impl App {
             }
         }
 
+        let mut preparing = false;
         let mut draws: Vec<Draw> = Vec::new();
         let video: Vec<&Track> = self
             .project
@@ -1397,14 +1494,19 @@ impl App {
             if let Some(mid) = d.media {
                 // During a scrub we take whatever is already decoded rather than stall the frame;
                 // the full-quality frame lands a moment later when the pointer settles.
-                let frame = if self.scrubbing || self.playing {
-                    self.cache
-                        .peek(mid, d.src)
-                        .or_else(|| self.cache.get(mid, d.src))
+                // Holds the last good picture while a span is still being prepared, rather than
+                // dropping to black.
+                let exact = if self.scrubbing || self.playing {
+                    self.cache.peek(mid, d.src).or_else(|| self.cache.get(mid, d.src))
                 } else {
                     self.cache.get(mid, d.src)
                 };
-                let Some(img) = frame else { continue };
+                let waiting = exact.is_none();
+                let Some(img) = exact.or_else(|| self.cache.last_good(mid)) else {
+                    preparing = true;
+                    continue;
+                };
+                preparing |= waiting;
                 let key = (mid << 40) ^ ((d.src as u64) << 8) ^ d.color.key();
                 let tex = self.texture_slot(ui.ctx(), layer, &img, &d.color, key);
                 layer += 1;
@@ -1484,6 +1586,22 @@ impl App {
             Stroke::new(1.0, theme::LINE),
             StrokeKind::Outside,
         );
+
+        if preparing {
+            let r = Rect::from_min_size(
+                egui::pos2(frame_rect.left() + 10.0, frame_rect.top() + 10.0),
+                Vec2::new(112.0, 22.0),
+            );
+            painter.rect_filled(r, CornerRadius::same(3), Color32::from_black_alpha(170));
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                "preparing…",
+                theme::mono(11.0),
+                theme::ACCENT,
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
 
         if self.project.media.is_empty() {
             let lines = [

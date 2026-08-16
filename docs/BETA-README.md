@@ -4,10 +4,10 @@ A video editor built around one idea: it should stay responsive on a modest lapt
 
 ## Getting going
 
-1. **Import** — drag video files onto the window, or press `Ctrl+I`.
-   Kite prepares each file in the background (you'll see a progress bar in the media list).
-   That step builds an all-intra playback file, which is why scrubbing is instant afterwards
-   regardless of how the original was compressed.
+1. **Import** — drag video files onto the window, or press `Ctrl+I`. A clip is ready to edit
+   about a second later however long it is: Kite prepares playback files for the parts of the
+   timeline you actually visit, not the whole file up front. The first time you land somewhere
+   new you may see "preparing…" for a moment.
 2. **Add to timeline** — double-click an item in the media pool.
 3. **Cut** — put the playhead where you want the cut and press `S`. Select the bad take and
    press `Shift+Del` to remove it and close the gap.

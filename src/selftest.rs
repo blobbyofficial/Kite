@@ -64,76 +64,83 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     let mut project = Project::default();
     let media_id = project.alloc_id();
     let importer = Importer::new(tools.clone(), dir.join("cache"), 2);
-    step!("building proxy and audio");
+    step!("probing and preparing");
     let t0 = Instant::now();
-    importer.submit(media_id, src.clone(), project.settings, 540);
+    importer.submit(media_id, src.clone(), project.settings.fps, 540);
 
-    let mut proxy_path = None;
+    let mut video_dir = None;
     let mut audio_path = None;
     let mut peaks_path = None;
     let mut frames = 0i64;
     let deadline = Instant::now() + Duration::from_secs(180);
+    let mut probed_ms = 0u128;
     loop {
         if Instant::now() > deadline {
             bail!("import timed out");
         }
         match importer.rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(ImportMsg::Ready { proxy, audio, peaks, frames: f, .. }) => {
-                proxy_path = proxy;
-                audio_path = audio;
-                peaks_path = peaks;
+            Ok(ImportMsg::Probed { info: i2, frames: f, video_dir: d, .. }) => {
+                probed_ms = t0.elapsed().as_millis();
                 frames = f;
+                video_dir = Some(d);
+                if !i2.has_video {
+                    bail!("probe lost the video stream");
+                }
+            }
+            Ok(ImportMsg::AudioReady { audio, peaks, .. }) => {
+                audio_path = Some(audio);
+                peaks_path = Some(peaks);
                 break;
             }
             Ok(ImportMsg::Failed { error, .. }) => bail!("import failed: {error}"),
-            Ok(_) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(e) => bail!("import channel closed: {e}"),
         }
     }
-    let import_ms = t0.elapsed().as_millis();
     if !(115..=125).contains(&frames) {
-        bail!("expected about 120 proxy frames at 30 fps, got {frames}");
+        bail!("expected about 120 frames at 30 fps, got {frames}");
     }
-    pass!("import finished in {import_ms} ms, {frames} frames");
-
-    // ---- 4. frame store + decode -----------------------------------------
-    let proxy = proxy_path.clone().context("no proxy was produced")?;
-    let store = FrameStore::open(&proxy)?;
-    if store.frames as i64 != frames {
-        bail!("frame store holds {} frames, importer reported {frames}", store.frames);
+    // Editing must be possible almost immediately; only the sound waits.
+    if probed_ms > 3000 {
+        bail!("probing took {probed_ms} ms, which is too long to call the clip editable");
     }
-    if store.height != 540 {
-        bail!("proxy height is {}, expected 540", store.height);
+    pass!("probed in {probed_ms} ms, {frames} frames, editable straight away");
+
+    // ---- 4. spans are built on demand ------------------------------------
+    let builder = crate::proxy::ProxyBuilder::new(tools.clone(), 2);
+    builder.register(crate::proxy::ProxySource {
+        media: media_id,
+        path: src.clone(),
+        dir: video_dir.clone().context("no span directory")?,
+        fps: project.settings.fps,
+        height: 540,
+        total_frames: frames,
+    });
+    let cache = FrameCache::new(64 * 1024 * 1024, 2, builder.clone());
+
+    // Nothing is built yet, so the first ask must not block — it should return nothing and
+    // queue the work.
+    if cache.get(media_id, 0).is_some() {
+        bail!("a span was somehow ready before anything asked for it");
     }
-    pass!("frame store {}x{}, {} frames", store.width, store.height, store.frames);
-
-    let cache = FrameCache::new(64 * 1024 * 1024, 2);
-    cache.register(media_id, proxy.clone());
-
-    // Decode scattered frames to prove random access really is random access.
-    let probe_frames = [0u32, 1, 59, 60, 61, (frames - 1) as u32];
     let t0 = Instant::now();
-    for f in probe_frames {
-        let img = cache
-            .get(media_id, f)
-            .with_context(|| format!("frame {f} did not decode"))?;
-        if img.width != store.width || img.height != store.height {
-            bail!("frame {f} decoded to {}x{}", img.width, img.height);
+    let mut first = None;
+    while Instant::now() < t0 + Duration::from_secs(60) {
+        if let Some(f) = cache.get(media_id, 0) {
+            first = Some(f);
+            break;
         }
-        if img.rgba.len() != (img.width * img.height * 4) as usize {
-            bail!("frame {f} has {} bytes, expected RGBA", img.rgba.len());
-        }
-        // testsrc2 is never a flat colour; an all-black frame means we decoded nothing.
-        if img.rgba.chunks(4).all(|p| p[0] < 4 && p[1] < 4 && p[2] < 4) {
-            bail!("frame {f} decoded to an empty image");
-        }
+        std::thread::sleep(Duration::from_millis(25));
     }
-    let per = t0.elapsed().as_secs_f64() * 1000.0 / probe_frames.len() as f64;
-    pass!("decoded {} scattered frames, {per:.2} ms each", probe_frames.len());
+    let first = first.context("the first span never became available")?;
+    let span_ms = t0.elapsed().as_millis();
+    if first.height != 540 {
+        bail!("span decoded at height {}", first.height);
+    }
+    pass!("first span ready in {span_ms} ms, {}x{}", first.width, first.height);
 
-    // A seek to a random frame must not be slower than a sequential one; that is the
-    // whole point of the all-intra store.
+    on_demand_check(&tools, &dir)?;
+
     let t0 = Instant::now();
     for f in 0..30u32 {
         cache.get(media_id, f).context("sequential decode failed")?;
@@ -143,7 +150,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
 
     let audio_file = audio_path.context("no audio track was extracted")?;
     let audio_bytes = std::fs::metadata(&audio_file)?.len();
-    let expect = 4.0 * 48_000.0 * 4.0; // 4 s, 48 kHz, stereo i16
+    let expect = 4.0 * 48_000.0 * 4.0;
     if (audio_bytes as f64) < expect * 0.8 {
         bail!("audio is {audio_bytes} bytes, expected around {expect}");
     }
@@ -166,7 +173,6 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         src_fps: info.fps,
         has_video: true,
         has_audio: true,
-        proxy_path: Some(proxy),
         audio_path: Some(audio_file),
         peaks_path: None,
         state: ImportState::Ready,
@@ -236,6 +242,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         width: project.settings.width,
         height: project.settings.height,
         fps: project.settings.fps,
+        include_audio: true,
     };
     let font = find_font();
     if font.is_none() {
@@ -266,7 +273,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
             bail!("export timed out");
         }
         match job.rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(ExportMsg::Done(_)) => break,
+            Ok(ExportMsg::Done { .. }) => break,
             Ok(ExportMsg::Failed(e)) => bail!("export failed: {e}"),
             Ok(ExportMsg::Progress { .. }) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -309,6 +316,103 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
 
     std::fs::remove_dir_all(&dir).ok();
     println!("\nAll checks passed.");
+    Ok(())
+}
+
+/// Renders a saved project from the command line, printing the filtergraph it built.
+pub fn export_cli(tools: Arc<Tools>, project_path: &str, out: &str) -> Result<()> {
+    let project = Project::load(std::path::Path::new(project_path))
+        .with_context(|| format!("loading {project_path}"))?;
+    let settings = ExportSettings {
+        path: std::path::PathBuf::from(out),
+        encoder: Encoder::X264,
+        quality: Quality::High,
+        width: project.settings.width,
+        height: project.settings.height,
+        fps: project.settings.fps,
+        include_audio: true,
+    };
+    let font = find_font();
+    let assets = export::Assets::prepare(font.as_deref())?;
+    let (inputs, graph, has_audio) = export::build_graph(&project, &settings, Some(&assets))?;
+    assets.cleanup();
+    println!("inputs: {inputs:#?}");
+    println!("has_audio: {has_audio}");
+    println!("--- filtergraph ---\n{graph}\n---");
+
+    run_export_blocking(&tools, project, settings)?;
+    let probed = ffmpeg::probe(&tools, std::path::Path::new(out))?;
+    println!(
+        "result: {}x{} {:.2}s video={} audio={}",
+        probed.width, probed.height, probed.duration, probed.has_video, probed.has_audio
+    );
+    if !probed.has_audio {
+        bail!("the exported file has no audio stream");
+    }
+    Ok(())
+}
+
+/// The point of building spans on demand is that a long recording costs nothing to open and that
+/// jumping into the middle of it prepares only what you landed on. This uses a clip long enough to
+/// span several segments and checks both.
+fn on_demand_check(tools: &Arc<Tools>, dir: &std::path::Path) -> Result<()> {
+    let long = dir.join("long.mp4");
+    let secs = 30;
+    let status = ffmpeg::command(&tools.ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"])
+        .args(["-t", &secs.to_string(), "-c:v", "libx264", "-preset", "ultrafast"])
+        .args(["-pix_fmt", "yuv420p", "-g", "60"])
+        .arg(&long)
+        .status()
+        .context("building the long test clip")?;
+    if !status.success() {
+        bail!("could not build the long test clip");
+    }
+
+    let frames = secs * 30;
+    let total_spans = ((frames + crate::proxy::SEG_FRAMES - 1) / crate::proxy::SEG_FRAMES) as u64;
+    let builder = crate::proxy::ProxyBuilder::new(tools.clone(), 2);
+    let media_id = 1u64;
+    builder.register(crate::proxy::ProxySource {
+        media: media_id,
+        path: long.clone(),
+        dir: dir.join("longspans"),
+        fps: 30,
+        height: 360,
+        total_frames: frames,
+    });
+    let cache = FrameCache::new(64 * 1024 * 1024, 2, builder.clone());
+
+    // Land near the end. Only the span under the playhead should be prepared.
+    let target = (frames - 20) as u32;
+    let t0 = Instant::now();
+    let mut got = None;
+    while Instant::now() < t0 + Duration::from_secs(90) {
+        if let Some(f) = cache.get(media_id, target) {
+            got = Some(f);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    got.context("the span at the end never became available")?;
+    let ms = t0.elapsed().as_millis();
+    let built = builder.built.load(std::sync::atomic::Ordering::Relaxed);
+
+    if built > 2 {
+        bail!("landing on one point built {built} spans; it should build the one it landed in");
+    }
+    if total_spans < 4 {
+        bail!("test clip is too short to exercise spanning ({total_spans} spans)");
+    }
+    // Seeking into a long file must not cost proportionally more than the start does.
+    if ms > 15_000 {
+        bail!("preparing a span {}s into the file took {ms} ms", secs);
+    }
+    pass!(
+        "seeked {}s in: {built} of {total_spans} spans built, ready in {ms} ms",
+        target / 30
+    );
+    std::fs::remove_file(&long).ok();
     Ok(())
 }
 
@@ -409,6 +513,7 @@ fn dissolve_check(
         width: 320,
         height: 180,
         fps: 30,
+            include_audio: true,
     };
     run_export_blocking(tools, project, settings)?;
 
@@ -443,7 +548,6 @@ fn media_item(id: u64, src: &std::path::Path, dur: f64) -> MediaItem {
         src_fps: 30.0,
         has_video: true,
         has_audio: true,
-        proxy_path: None,
         audio_path: None,
         peaks_path: None,
         state: ImportState::Ready,
@@ -489,6 +593,7 @@ fn speed_check(
         width: 640,
         height: 360,
         fps: 30,
+            include_audio: true,
     };
     run_export_blocking(tools, project, settings)?;
     let probed = ffmpeg::probe(tools, &out)?;
@@ -515,7 +620,7 @@ fn run_export_blocking(
             bail!("export timed out");
         }
         match job.rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(ExportMsg::Done(_)) => return Ok(()),
+            Ok(ExportMsg::Done { .. }) => return Ok(()),
             Ok(ExportMsg::Failed(e)) => bail!("export failed: {e}"),
             Ok(_) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -552,6 +657,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         width: 640,
         height: 360,
         fps: 30,
+            include_audio: true,
     };
     let assets = export::Assets::prepare(None)?;
     let (_, graph, _) = export::build_graph(&project, &settings, Some(&assets))?;

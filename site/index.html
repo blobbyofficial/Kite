@@ -203,9 +203,10 @@
       </div>
       <div class="cell">
         <span class="tag">Nothing to set up</span>
-        <h3>Install and cut</h3>
-        <p>ffmpeg comes bundled. No codec packs, no render settings to learn first, no account,
-        no cloud, no telemetry. It opens and you start.</p>
+        <h3>Import is instant</h3>
+        <p>A clip is editable about a second after you add it, however long it is, because the
+        playback files are prepared as you go rather than up front. ffmpeg is bundled: no codec
+        packs, no account, no cloud, no telemetry.</p>
       </div>
     </div>
   </div>
@@ -218,8 +219,11 @@
       <p>Camera and screen-capture footage is nearly always long-GOP H.264 or HEVC: most frames are
       stored as differences from earlier ones. To show frame 4,000 the decoder may have to walk
       through hundreds of frames first. That is the stutter you feel when you scrub.</p>
-      <p>On import, Kite transcodes each file once into an indexed format where every frame stands
-      alone. After that, finding a frame is a lookup in a table.</p>
+      <p>Kite converts the footage into an indexed format where every frame stands alone, so
+      finding a frame is a lookup in a table. Crucially it does this <em>only for the parts you
+      actually visit</em>: the file is divided into short spans and a span is prepared the moment
+      the timeline asks for a frame inside it. Opening a two-hour recording costs nothing, and
+      jumping an hour in prepares that one span, not the hour before it.</p>
     </div>
 
     <figure>
@@ -264,7 +268,8 @@
         <text x="410" y="164" font-family="ui-monospace,monospace" font-size="12.5" font-weight="600" fill="#4FC98A">1.3 ms, any frame</text>
       </svg>
       <figcaption>Measured on a standard Windows CI machine at 960×540 playback resolution. The
-      same check runs on every build, so this number cannot quietly regress.</figcaption>
+      same check runs on every build, so this number cannot quietly regress — including a test
+      that seeking 29 seconds into a clip prepares one span out of six.</figcaption>
     </figure>
 
     <h3>Three other things that keep it responsive</h3>
@@ -352,7 +357,7 @@
           <tr><td class="k">Colour</td><td class="y">Brightness, contrast and saturation per clip, with one-click looks</td></tr>
           <tr><td class="k">Speed</td><td class="y">0.25× to 4×, with the audio retimed to match</td></tr>
           <tr><td class="k">Audio</td><td class="y">Per-clip volume in dB, fades, waveforms, level meters</td></tr>
-          <tr><td class="k">Project</td><td class="y">Undo/redo, save and reopen, autosave with crash recovery, automatic playback-file cache</td></tr>
+          <tr><td class="k">Project</td><td class="y">Sequence matched to your first clip, undo/redo, save and reopen, autosave with crash recovery</td></tr>
           <tr><td class="k">Export</td><td class="y">H.264 MP4 from your original media, hardware encoding when available</td></tr>
           <tr><td class="k">Grading</td><td class="n">Not yet — no curves, wheels or scopes</td></tr>
           <tr><td class="k">Effects</td><td class="n">Not yet — no keyframes, and crossfade is the only transition</td></tr>

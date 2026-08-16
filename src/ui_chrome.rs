@@ -130,18 +130,35 @@ pub fn top_bar(app: &mut App, ctx: &Context) {
                     ui.label(format!("Audio: {}", app.audio.device_name));
                 });
 
-                ui.separator();
-                if ui.button("＋ Import").on_hover_text("Ctrl+I").clicked() {
-                    app.import_dialog();
-                }
-                if ui.button("⏵ Export").on_hover_text("Ctrl+E").clicked() {
-                    app.show_export = true;
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&app.project.name)
+                        .color(theme::TEXT)
+                        .size(12.5),
+                );
+                if app.dirty {
+                    ui.label(
+                        egui::RichText::new("unsaved")
+                            .font(theme::mono(9.5))
+                            .color(theme::WARN),
+                    );
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let name = app.project.name.clone();
-                    let dirty = if app.dirty { " •" } else { "" };
-                    ui.label(egui::RichText::new(format!("{name}{dirty}")).color(theme::TEXT_DIM));
+                    if ui
+                        .add(egui::Button::new("Export").min_size(Vec2::new(74.0, 24.0)))
+                        .on_hover_text("Render the finished video   Ctrl+E")
+                        .clicked()
+                    {
+                        app.show_export = true;
+                    }
+                    if ui
+                        .button("Import media")
+                        .on_hover_text("Add footage, music or images   Ctrl+I")
+                        .clicked()
+                    {
+                        app.import_dialog();
+                    }
                 });
             });
         });
@@ -157,7 +174,7 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("MEDIA").font(theme::mono(11.0)).color(theme::TEXT_DIM));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("＋").on_hover_text("Import media").clicked() {
+                    if ui.small_button("+").on_hover_text("Import media").clicked() {
                         app.import_dialog();
                     }
                 });
@@ -180,9 +197,10 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
             let mut to_remove: Option<MediaId> = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let items: Vec<_> = app.project.media.iter().map(|m| {
-                    (m.id, m.name.clone(), m.state, m.duration, m.has_video, m.has_audio, m.error.clone())
+                    (m.id, m.name.clone(), m.state, m.duration, m.has_video, m.has_audio,
+                     m.error.clone(), m.audio_path.is_some())
                 }).collect();
-                for (id, name, state, duration, has_v, has_a, err) in items {
+                for (id, name, state, duration, has_v, has_a, err, audio_ready) in items {
                     let selected = app.selected_media == Some(id);
                     let resp = ui.allocate_response(
                         Vec2::new(ui.available_width(), 40.0),
@@ -198,16 +216,25 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                     };
                     ui.painter().rect_filled(r, CornerRadius::same(3), bg);
 
-                    let icon = if has_v { "▣" } else if has_a { "♪" } else { "?" };
-                    ui.painter().text(
-                        Pos2::new(r.left() + 8.0, r.center().y),
-                        Align2::LEFT_CENTER,
-                        icon,
-                        theme::ui_font(13.0),
-                        theme::TEXT_DIM,
+                    // Drawn rather than typed: glyphs for these fall back to tofu in the
+                    // default font set.
+                    let ic = Rect::from_center_size(
+                        Pos2::new(r.left() + 15.0, r.center().y),
+                        Vec2::new(15.0, 11.0),
                     );
+                    let icol = if has_v { theme::VIDEO_CLIP_HI } else { theme::AUDIO_CLIP_HI };
+                    ui.painter().rect_filled(ic, CornerRadius::same(2), icol);
+                    if has_a && !has_v {
+                        ui.painter().line_segment(
+                            [
+                                Pos2::new(ic.left() + 3.0, ic.center().y),
+                                Pos2::new(ic.right() - 3.0, ic.center().y),
+                            ],
+                            egui::Stroke::new(1.5, theme::WAVE),
+                        );
+                    }
                     let text_rect = Rect::from_min_max(
-                        Pos2::new(r.left() + 26.0, r.top() + 3.0),
+                        Pos2::new(r.left() + 28.0, r.top() + 3.0),
                         Pos2::new(r.right() - 4.0, r.bottom() - 3.0),
                     );
                     ui.painter().with_clip_rect(text_rect).text(
@@ -219,12 +246,16 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                     );
 
                     let sub = match state {
-                        ImportState::Queued => "queued…".to_string(),
-                        ImportState::Probing => "reading…".to_string(),
+                        ImportState::Queued | ImportState::Probing => "reading…".to_string(),
                         ImportState::Building(p) => format!("preparing  {p}%"),
                         ImportState::Ready => {
                             let secs = duration.max(0.0);
-                            format!("{:02}:{:05.2}", (secs / 60.0) as u32, secs % 60.0)
+                            let len = format!("{:02}:{:05.2}", (secs / 60.0) as u32, secs % 60.0);
+                            if has_a && !audio_ready {
+                                format!("{len}  ·  sound…")
+                            } else {
+                                len
+                            }
                         }
                         ImportState::Failed => err.unwrap_or_else(|| "failed".into()),
                     };
@@ -243,8 +274,8 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
 
                     if let ImportState::Building(p) = state {
                         let bar = Rect::from_min_max(
-                            Pos2::new(r.left() + 26.0, r.bottom() - 2.0),
-                            Pos2::new(r.left() + 26.0 + (r.width() - 30.0) * p as f32 / 100.0, r.bottom()),
+                            Pos2::new(r.left() + 28.0, r.bottom() - 2.0),
+                            Pos2::new(r.left() + 28.0 + (r.width() - 32.0) * p as f32 / 100.0, r.bottom()),
                         );
                         ui.painter().rect_filled(bar, CornerRadius::ZERO, theme::ACCENT);
                     }
@@ -290,22 +321,32 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
 pub fn inspector(app: &mut App, ctx: &Context) {
     egui::SidePanel::right("inspector")
         .resizable(true)
-        .default_width(250.0)
-        .width_range(200.0..=420.0)
-        .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::same(8)))
+        .default_width(272.0)
+        .width_range(220.0..=440.0)
+        .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::same(10)))
         .show(ctx, |ui| {
-            ui.label(egui::RichText::new("INSPECTOR").font(theme::mono(11.0)).color(theme::TEXT_DIM));
-            ui.add_space(6.0);
-
             let sel = app.project.selected_ids();
             if sel.is_empty() {
-                ui.label(egui::RichText::new("Select a clip on the timeline").color(theme::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new("INSPECTOR").font(theme::mono(10.0)).color(theme::TEXT_FAINT),
+                );
+                ui.add_space(18.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Nothing selected")
+                            .color(theme::TEXT_DIM)
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Click a clip on the timeline\nto change how it looks and sounds.")
+                            .color(theme::TEXT_FAINT)
+                            .size(11.5),
+                    );
+                });
                 return;
             }
-            if sel.len() > 1 {
-                ui.label(format!("{} clips selected", sel.len()));
-                ui.add_space(6.0);
-            }
+
             let cid = sel[0];
             let Some((track, clip)) = app.project.clip(cid) else { return };
             let kind = track.kind;
@@ -316,64 +357,135 @@ pub fn inspector(app: &mut App, ctx: &Context) {
             let mut crossfade: Option<i64> = None;
 
             let title = match &c.source {
-                ClipSource::Media(m) => app.project.media(*m).map(|m| m.name.clone()).unwrap_or_default(),
+                ClipSource::Media(m) => {
+                    app.project.media(*m).map(|m| m.name.clone()).unwrap_or_default()
+                }
                 ClipSource::Text(_) => "Title".into(),
                 ClipSource::Color(_) => "Colour card".into(),
             };
-            ui.label(egui::RichText::new(title).strong());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).strong().size(13.0));
+                if sel.len() > 1 {
+                    ui.label(
+                        egui::RichText::new(format!("+{}", sel.len() - 1))
+                            .font(theme::mono(10.0))
+                            .color(theme::ACCENT),
+                    );
+                }
+            });
             ui.label(
                 egui::RichText::new(format!(
-                    "{}  →  {}   ({})",
+                    "{}  →  {}      {}",
                     timecode(c.start, fps),
                     timecode(c.end(), fps),
                     timecode(c.len, fps)
                 ))
                 .font(theme::mono(10.0))
-                .color(theme::TEXT_DIM),
+                .color(theme::TEXT_FAINT),
             );
+            ui.add_space(4.0);
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let ClipSource::Text(t) = &mut c.source {
-                    ui.label("Text");
+                    theme::section(ui, "TEXT");
                     if ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2)).changed() {
                         changed = true;
                     }
-                    changed |= ui.add(egui::Slider::new(&mut t.size, 0.02..=0.35).text("Size")).changed();
+                    changed |= theme::row(ui, "Size", |ui| {
+                        ui.add(egui::Slider::new(&mut t.size, 0.02..=0.35).show_value(false))
+                    })
+                    .changed();
+                    theme::row(ui, "Align", |ui| {
+                        ui.horizontal(|ui| {
+                            for (a, l) in [
+                                (TextAlign::Left, "Left"),
+                                (TextAlign::Center, "Centre"),
+                                (TextAlign::Right, "Right"),
+                            ] {
+                                if ui.selectable_label(t.align == a, l).clicked() {
+                                    t.align = a;
+                                    changed = true;
+                                }
+                            }
+                        })
+                        .response
+                    });
+                    changed |= theme::row(ui, "Across", |ui| {
+                        ui.add(egui::Slider::new(&mut t.x, 0.0..=1.0).show_value(false))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Down", |ui| {
+                        ui.add(egui::Slider::new(&mut t.y, 0.0..=1.0).show_value(false))
+                    })
+                    .changed();
+                    let mut col = Color32::from_rgba_unmultiplied(
+                        t.color[0], t.color[1], t.color[2], t.color[3],
+                    );
+                    theme::row(ui, "Colour", |ui| {
+                        let r = ui.color_edit_button_srgba(&mut col);
+                        if r.changed() {
+                            t.color = [col.r(), col.g(), col.b(), col.a()];
+                            changed = true;
+                        }
+                        r
+                    });
+                    changed |= ui.checkbox(&mut t.shadow, "Drop shadow").changed();
+                    changed |= ui.checkbox(&mut t.box_bg, "Background box").changed();
+                }
+
+                if kind == TrackKind::Video {
+                    theme::section(ui, "PICTURE");
+                    changed |= theme::row(ui, "Opacity", |ui| {
+                        ui.add(egui::Slider::new(&mut c.opacity, 0.0..=1.0))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Scale", |ui| {
+                        ui.add(egui::Slider::new(&mut c.scale, 0.05..=4.0).logarithmic(true))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Across", |ui| {
+                        ui.add(egui::Slider::new(&mut c.pos_x, -1.0..=1.0))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Down", |ui| {
+                        ui.add(egui::Slider::new(&mut c.pos_y, -1.0..=1.0))
+                    })
+                    .changed();
+                    if ui.small_button("Reset picture").clicked() {
+                        c.scale = 1.0;
+                        c.pos_x = 0.0;
+                        c.pos_y = 0.0;
+                        c.opacity = 1.0;
+                        changed = true;
+                    }
+
+                    theme::section(ui, "COLOUR");
+                    changed |= theme::row(ui, "Brightness", |ui| {
+                        ui.add(egui::Slider::new(&mut c.color.brightness, -0.5..=0.5))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Contrast", |ui| {
+                        ui.add(egui::Slider::new(&mut c.color.contrast, 0.0..=2.5))
+                    })
+                    .changed();
+                    changed |= theme::row(ui, "Saturation", |ui| {
+                        ui.add(egui::Slider::new(&mut c.color.saturation, 0.0..=2.5))
+                    })
+                    .changed();
                     ui.horizontal(|ui| {
-                        ui.label("Align");
-                        for (a, l) in [(TextAlign::Left, "L"), (TextAlign::Center, "C"), (TextAlign::Right, "R")] {
-                            if ui.selectable_label(t.align == a, l).clicked() {
-                                t.align = a;
+                        for (label, v) in [
+                            ("Punchy", ColorAdjust { brightness: 0.02, contrast: 1.15, saturation: 1.18 }),
+                            ("Flat", ColorAdjust { brightness: 0.0, contrast: 0.88, saturation: 0.9 }),
+                            ("Mono", ColorAdjust { brightness: 0.0, contrast: 1.05, saturation: 0.0 }),
+                            ("None", ColorAdjust::default()),
+                        ] {
+                            if ui.small_button(label).clicked() {
+                                c.color = v;
                                 changed = true;
                             }
                         }
                     });
-                    changed |= ui.add(egui::Slider::new(&mut t.x, 0.0..=1.0).text("X")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut t.y, 0.0..=1.0).text("Y")).changed();
-                    let mut col = Color32::from_rgba_unmultiplied(t.color[0], t.color[1], t.color[2], t.color[3]);
-                    if ui.color_edit_button_srgba(&mut col).changed() {
-                        t.color = [col.r(), col.g(), col.b(), col.a()];
-                        changed = true;
-                    }
-                    changed |= ui.checkbox(&mut t.shadow, "Drop shadow").changed();
-                    changed |= ui.checkbox(&mut t.box_bg, "Background box").changed();
-                    ui.separator();
-                }
-
-                if kind == TrackKind::Video {
-                    ui.label("Picture");
-                    changed |= ui.add(egui::Slider::new(&mut c.opacity, 0.0..=1.0).text("Opacity")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut c.scale, 0.05..=4.0).logarithmic(true).text("Scale")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut c.pos_x, -1.0..=1.0).text("Position X")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut c.pos_y, -1.0..=1.0).text("Position Y")).changed();
-                    if ui.button("Reset transform").clicked() {
-                        c.scale = 1.0;
-                        c.pos_x = 0.0;
-                        c.pos_y = 0.0;
-                        changed = true;
-                    }
-                    ui.separator();
                 }
 
                 let has_audio = c
@@ -381,89 +493,72 @@ pub fn inspector(app: &mut App, ctx: &Context) {
                     .and_then(|m| app.project.media(m).map(|m| m.has_audio))
                     .unwrap_or(false);
                 if has_audio {
-                    ui.label("Audio");
+                    theme::section(ui, "SOUND");
                     let mut db = if c.volume <= 0.0001 { -60.0 } else { 20.0 * c.volume.log10() };
-                    if ui.add(egui::Slider::new(&mut db, -60.0..=12.0).text("Volume dB")).changed() {
+                    let r = theme::row(ui, "Volume", |ui| {
+                        ui.add(egui::Slider::new(&mut db, -60.0..=12.0).suffix(" dB"))
+                    });
+                    if r.changed() {
                         c.volume = if db <= -59.9 { 0.0 } else { 10f32.powf(db / 20.0) };
                         changed = true;
                     }
-                    ui.separator();
+                    if c.volume <= 0.0001 {
+                        ui.label(
+                            egui::RichText::new("Silent — this clip will have no sound on export")
+                                .color(theme::WARN)
+                                .size(11.0),
+                        );
+                    }
                 }
 
-                if kind == TrackKind::Video {
-                    ui.label("Colour");
-                    changed |= ui
-                        .add(egui::Slider::new(&mut c.color.brightness, -0.5..=0.5).text("Brightness"))
-                        .changed();
-                    changed |= ui
-                        .add(egui::Slider::new(&mut c.color.contrast, 0.0..=2.5).text("Contrast"))
-                        .changed();
-                    changed |= ui
-                        .add(egui::Slider::new(&mut c.color.saturation, 0.0..=2.5).text("Saturation"))
-                        .changed();
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Punchy").clicked() {
-                            c.color = ColorAdjust { brightness: 0.02, contrast: 1.15, saturation: 1.18 };
-                            changed = true;
-                        }
-                        if ui.small_button("Flat").clicked() {
-                            c.color = ColorAdjust { brightness: 0.0, contrast: 0.88, saturation: 0.9 };
-                            changed = true;
-                        }
-                        if ui.small_button("Mono").clicked() {
-                            c.color = ColorAdjust { brightness: 0.0, contrast: 1.05, saturation: 0.0 };
-                            changed = true;
-                        }
-                        if ui.small_button("Reset").clicked() {
-                            c.color = ColorAdjust::default();
-                            changed = true;
-                        }
-                    });
-                    ui.separator();
-                }
-
-                ui.label("Speed");
+                theme::section(ui, "SPEED");
                 let mut speed = c.speed;
-                let speed_resp = ui.add(
-                    egui::Slider::new(&mut speed, 0.25..=4.0)
-                        .logarithmic(true)
-                        .text("×"),
-                );
+                let sr = theme::row(ui, "Rate", |ui| {
+                    ui.add(egui::Slider::new(&mut speed, 0.25..=4.0).logarithmic(true).suffix("×"))
+                });
                 ui.horizontal(|ui| {
-                    for (label, v) in [("0.5×", 0.5f32), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)] {
+                    for (label, v) in [("½×", 0.5f32), ("1×", 1.0), ("2×", 2.0), ("4×", 4.0)] {
                         if ui.small_button(label).clicked() {
                             speed = v;
                         }
                     }
                 });
-                if speed_resp.changed() || (speed - c.speed).abs() > 1e-4 {
+                if sr.changed() || (speed - c.speed).abs() > 1e-4 {
                     speed_change = Some(speed);
                 }
-                ui.separator();
 
-                ui.label("Crossfade from previous clip");
+                theme::section(ui, "TRANSITION");
                 let mut tr = c.transition_in;
-                if ui
-                    .add(egui::Slider::new(&mut tr, 0..=(c.len.min(fps as i64 * 3)).max(1)).text("Frames"))
-                    .changed()
+                let max_tr = c.len.min(fps as i64 * 3).max(1);
+                if theme::row(ui, "Crossfade", |ui| {
+                    ui.add(egui::Slider::new(&mut tr, 0..=max_tr).suffix(" fr"))
+                })
+                .changed()
                 {
                     c.transition_in = tr;
                     changed = true;
                 }
-                if ui.button("Add ½ second dissolve").clicked() {
+                if ui.small_button("½ second dissolve").clicked() {
                     crossfade = Some((fps as i64 / 2).max(1));
                 }
-                ui.separator();
 
-                ui.label("Fades");
+                theme::section(ui, "FADES");
                 let max_fade = (c.len / 2).max(1);
                 let mut fi = c.fade_in;
                 let mut fo = c.fade_out;
-                if ui.add(egui::Slider::new(&mut fi, 0..=max_fade).text("In (frames)")).changed() {
+                if theme::row(ui, "In", |ui| {
+                    ui.add(egui::Slider::new(&mut fi, 0..=max_fade).suffix(" fr"))
+                })
+                .changed()
+                {
                     c.fade_in = fi;
                     changed = true;
                 }
-                if ui.add(egui::Slider::new(&mut fo, 0..=max_fade).text("Out (frames)")).changed() {
+                if theme::row(ui, "Out", |ui| {
+                    ui.add(egui::Slider::new(&mut fo, 0..=max_fade).suffix(" fr"))
+                })
+                .changed()
+                {
                     c.fade_out = fo;
                     changed = true;
                 }
@@ -476,12 +571,13 @@ pub fn inspector(app: &mut App, ctx: &Context) {
                         c.fade_out = (fps as i64 / 2).min(max_fade);
                         changed = true;
                     }
-                    if ui.small_button("none").clicked() {
+                    if ui.small_button("None").clicked() {
                         c.fade_in = 0;
                         c.fade_out = 0;
                         changed = true;
                     }
                 });
+                ui.add_space(12.0);
             });
 
             if changed {
@@ -498,48 +594,75 @@ pub fn inspector(app: &mut App, ctx: &Context) {
 
 pub fn transport(app: &mut App, ctx: &Context) {
     egui::TopBottomPanel::bottom("transport")
-        .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(8, 5)))
+        .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 7)))
         .show(ctx, |ui| {
+            // Three explicit regions. A right-to-left sub-layout claims all remaining width, so
+            // anything centred has to be given its own reserved space rather than added after.
             ui.horizontal(|ui| {
-                if ui.button("⏮").on_hover_text("Start (Home)").clicked() {
-                    app.set_playhead(0);
-                }
-                if ui.button("◀").on_hover_text("Previous frame (←)").clicked() {
-                    let p = app.playhead - 1;
-                    app.set_playhead(p);
-                }
-                let label = if app.playing { "⏸" } else { "▶" };
-                if ui
-                    .add(egui::Button::new(egui::RichText::new(label).size(15.0)).min_size(Vec2::new(44.0, 24.0)))
-                    .on_hover_text("Play / pause (Space)")
-                    .clicked()
-                {
-                    app.toggle_play();
-                }
-                if ui.button("▶").on_hover_text("Next frame (→)").clicked() {
-                    let p = app.playhead + 1;
-                    app.set_playhead(p);
-                }
-                if ui.button("⏭").on_hover_text("End (End)").clicked() {
-                    let d = app.duration();
-                    app.set_playhead(d);
-                }
+                let total = ui.available_width();
+                let side = (total * 0.3).clamp(150.0, 260.0);
+                let mid = (total - side * 2.0).max(150.0);
+                let h = 30.0;
 
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(timecode(app.playhead, app.fps()))
-                        .font(theme::mono(15.0))
-                        .color(theme::TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(format!("/ {}", timecode(app.duration(), app.fps())))
-                        .font(theme::mono(11.0))
-                        .color(theme::TEXT_DIM),
+                ui.allocate_ui_with_layout(
+                    Vec2::new(side, h),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(timecode(app.playhead, app.fps()))
+                                .font(theme::mono(18.0))
+                                .color(theme::TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new(timecode(app.duration(), app.fps()))
+                                .font(theme::mono(10.5))
+                                .color(theme::TEXT_FAINT),
+                        );
+                    },
                 );
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    meters(app, ui);
-                });
+                ui.allocate_ui_with_layout(
+                    Vec2::new(mid, h),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("⏮").on_hover_text("Go to start   Home").clicked() {
+                                app.set_playhead(0);
+                            }
+                            if ui.button("◀").on_hover_text("Back one frame   ←").clicked() {
+                                let p = app.playhead - 1;
+                                app.set_playhead(p);
+                            }
+                            let label = if app.playing { "⏸" } else { "▶" };
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(label).size(16.0))
+                                        .min_size(Vec2::new(56.0, 28.0)),
+                                )
+                                .on_hover_text("Play or pause   Space")
+                                .clicked()
+                            {
+                                app.toggle_play();
+                            }
+                            if ui.button("▶").on_hover_text("Forward one frame   →").clicked() {
+                                let p = app.playhead + 1;
+                                app.set_playhead(p);
+                            }
+                            if ui.button("⏭").on_hover_text("Go to end   End").clicked() {
+                                let d = app.duration();
+                                app.set_playhead(d);
+                            }
+                        });
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(side, h),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        meters(app, ui);
+                    },
+                );
             });
         });
 }
@@ -598,6 +721,8 @@ pub fn status_bar(app: &mut App, ctx: &Context, frame_ms: f32) {
 
 pub fn overlays(app: &mut App, ctx: &Context) {
     recovery_prompt(app, ctx);
+    new_project_dialog(app, ctx);
+    add_track_dialog(app, ctx);
     export_dialog(app, ctx);
     export_progress(app, ctx);
     shortcuts_window(app, ctx);
@@ -626,77 +751,270 @@ fn recovery_prompt(app: &mut App, ctx: &Context) {
         });
 }
 
+/// The start screen. Previously a project simply appeared, already called "Untitled" and already
+/// 1920x1080 at 30fps, with no indication that any of that was a choice.
+fn new_project_dialog(app: &mut App, ctx: &Context) {
+    if !app.show_new_project {
+        return;
+    }
+    egui::Window::new("New project")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.add_space(2.0);
+            theme::row(ui, "Name", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.new_proj.name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("My video"),
+                )
+            });
+
+            ui.add_space(10.0);
+            ui.checkbox(
+                &mut app.new_proj.from_first_clip,
+                "Match the first clip I add",
+            )
+            .on_hover_text("The sequence takes the size and frame rate of your footage");
+            ui.label(
+                egui::RichText::new(
+                    "Recommended — you almost never want to work at a different size from your footage.",
+                )
+                .color(theme::TEXT_FAINT)
+                .size(11.0),
+            );
+
+            ui.add_space(8.0);
+            ui.add_enabled_ui(!app.new_proj.from_first_clip, |ui| {
+                theme::row(ui, "Size", |ui| {
+                    egui::ComboBox::from_id_salt("npres")
+                        .selected_text(format!("{}×{}", app.new_proj.width, app.new_proj.height))
+                        .show_ui(ui, |ui| {
+                            for (w, h, name) in RESOLUTIONS {
+                                if ui
+                                    .selectable_label(
+                                        app.new_proj.width == w && app.new_proj.height == h,
+                                        name,
+                                    )
+                                    .clicked()
+                                {
+                                    app.new_proj.width = w;
+                                    app.new_proj.height = h;
+                                }
+                            }
+                        })
+                        .response
+                });
+                theme::row(ui, "Frame rate", |ui| {
+                    egui::ComboBox::from_id_salt("npfps")
+                        .selected_text(format!("{} fps", app.new_proj.fps))
+                        .show_ui(ui, |ui| {
+                            for f in [24u32, 25, 30, 50, 60] {
+                                if ui
+                                    .selectable_label(app.new_proj.fps == f, format!("{f} fps"))
+                                    .clicked()
+                                {
+                                    app.new_proj.fps = f;
+                                }
+                            }
+                        })
+                        .response
+                });
+            });
+
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Start editing").min_size(Vec2::new(130.0, 28.0)))
+                    .clicked()
+                {
+                    app.create_project();
+                }
+                if ui.button("Open a project…").clicked() {
+                    app.show_new_project = false;
+                    app.open();
+                }
+            });
+        });
+}
+
+pub const RESOLUTIONS: [(u32, u32, &str); 6] = [
+    (1920, 1080, "1920×1080   HD"),
+    (2560, 1440, "2560×1440   QHD"),
+    (3840, 2160, "3840×2160   4K"),
+    (1080, 1920, "1080×1920   Vertical"),
+    (1080, 1080, "1080×1080   Square"),
+    (1280, 720, "1280×720    720p"),
+];
+
+fn add_track_dialog(app: &mut App, ctx: &Context) {
+    if !app.show_add_track {
+        return;
+    }
+    egui::Window::new("Add a track")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(260.0);
+            ui.label(
+                egui::RichText::new("Video tracks stack upward — anything on a higher track covers what is below it.")
+                    .color(theme::TEXT_DIM)
+                    .size(11.5),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Video track").min_size(Vec2::new(110.0, 26.0))).clicked() {
+                    app.add_track(TrackKind::Video);
+                    app.show_add_track = false;
+                }
+                if ui.add(egui::Button::new("Audio track").min_size(Vec2::new(110.0, 26.0))).clicked() {
+                    app.add_track(TrackKind::Audio);
+                    app.show_add_track = false;
+                }
+            });
+            ui.add_space(6.0);
+            if ui.small_button("Cancel").clicked() {
+                app.show_add_track = false;
+            }
+        });
+}
+
 fn export_dialog(app: &mut App, ctx: &Context) {
     if !app.show_export {
         return;
     }
     let mut open = true;
+    let (audio_clips, silent_clips, muted_has_audio) = crate::export::audio_summary(&app.project);
     egui::Window::new("Export video")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            ui.set_min_width(460.0);
+
+            theme::section(ui, "FILE");
             ui.horizontal(|ui| {
-                ui.label("File");
                 let shown = app.export_settings.path.display().to_string();
-                ui.label(egui::RichText::new(elide(&shown, 42)).font(theme::mono(10.5)).color(theme::TEXT_DIM));
-                if ui.button("Change…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Export to")
-                        .add_filter("MP4 video", &["mp4"])
-                        .set_file_name("my-video.mp4")
-                        .save_file()
-                    {
-                        app.export_settings.path = p;
+                ui.label(
+                    egui::RichText::new(elide(&shown, 46))
+                        .font(theme::mono(10.5))
+                        .color(theme::TEXT_DIM),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Change…").clicked() {
+                        let name = format!("{}.mp4", sanitise(&app.project.name));
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_title("Export to")
+                            .add_filter("MP4 video", &["mp4"])
+                            .set_file_name(&name)
+                            .save_file()
+                        {
+                            app.export_settings.path = p;
+                        }
                     }
-                }
+                });
             });
-            ui.separator();
 
-            let mut q = app.export_settings.quality;
-            egui::ComboBox::from_label("Quality")
-                .selected_text(q.label())
-                .show_ui(ui, |ui| {
-                    for opt in [Quality::High, Quality::Balanced, Quality::Small] {
-                        ui.selectable_value(&mut q, opt, opt.label());
-                    }
-                });
-            app.export_settings.quality = q;
-
-            let mut e = app.export_settings.encoder;
+            theme::section(ui, "PICTURE");
+            let mut s = app.export_settings.clone();
+            theme::row(ui, "Size", |ui| {
+                egui::ComboBox::from_id_salt("exres")
+                    .selected_text(format!("{}×{}", s.width, s.height))
+                    .show_ui(ui, |ui| {
+                        let (pw, ph) = (app.project.settings.width, app.project.settings.height);
+                        if ui
+                            .selectable_label(s.width == pw && s.height == ph, format!("{pw}×{ph}   (sequence)"))
+                            .clicked()
+                        {
+                            s.width = pw;
+                            s.height = ph;
+                        }
+                        for (w, h, name) in RESOLUTIONS {
+                            if ui.selectable_label(s.width == w && s.height == h, name).clicked() {
+                                s.width = w;
+                                s.height = h;
+                            }
+                        }
+                    })
+                    .response
+            });
+            theme::row(ui, "Frame rate", |ui| {
+                egui::ComboBox::from_id_salt("exfps")
+                    .selected_text(format!("{} fps", s.fps))
+                    .show_ui(ui, |ui| {
+                        for f in [24u32, 25, 30, 50, 60] {
+                            if ui.selectable_label(s.fps == f, format!("{f} fps")).clicked() {
+                                s.fps = f;
+                            }
+                        }
+                    })
+                    .response
+            });
+            theme::row(ui, "Quality", |ui| {
+                egui::ComboBox::from_id_salt("exq")
+                    .selected_text(s.quality.label())
+                    .show_ui(ui, |ui| {
+                        for opt in [Quality::High, Quality::Balanced, Quality::Small] {
+                            ui.selectable_value(&mut s.quality, opt, opt.label());
+                        }
+                    })
+                    .response
+            });
             let encoders = app.encoders.clone();
-            egui::ComboBox::from_label("Encoder")
-                .selected_text(e.label())
-                .show_ui(ui, |ui| {
-                    for opt in encoders {
-                        ui.selectable_value(&mut e, opt, opt.label());
-                    }
-                });
-            app.export_settings.encoder = e;
+            theme::row(ui, "Encoder", |ui| {
+                egui::ComboBox::from_id_salt("exenc")
+                    .selected_text(s.encoder.label())
+                    .show_ui(ui, |ui| {
+                        for opt in encoders {
+                            ui.selectable_value(&mut s.encoder, opt, opt.label());
+                        }
+                    })
+                    .response
+            });
 
+            theme::section(ui, "SOUND");
+            ui.checkbox(&mut s.include_audio, "Include audio");
+            let (msg, col) = if !s.include_audio {
+                ("Audio is switched off — the file will be silent.".to_string(), theme::WARN)
+            } else if audio_clips == 0 && muted_has_audio {
+                (
+                    "No sound: every clip with audio is on a muted track. Unmute it with the M button."
+                        .to_string(),
+                    theme::BAD,
+                )
+            } else if audio_clips == 0 {
+                ("No sound: nothing on the timeline has an audio track.".to_string(), theme::WARN)
+            } else if silent_clips == audio_clips {
+                ("No sound: every audio clip has its volume at zero.".to_string(), theme::BAD)
+            } else if silent_clips > 0 {
+                (
+                    format!("{audio_clips} clips with sound, {silent_clips} of them silenced"),
+                    theme::WARN,
+                )
+            } else {
+                (format!("{audio_clips} clip(s) with sound"), theme::GOOD)
+            };
+            ui.label(egui::RichText::new(msg).color(col).size(11.5));
+
+            app.export_settings = s;
+
+            ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "{}×{} · {} fps · {}",
-                    app.export_settings.width,
-                    app.export_settings.height,
-                    app.export_settings.fps,
+                    "{} of timeline · reads your original files, not the playback copies",
                     timecode(app.duration(), app.fps())
                 ))
                 .font(theme::mono(10.5))
-                .color(theme::TEXT_DIM),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Export always reads your original files, not the playback proxies.")
-                    .font(theme::ui_font(10.5))
-                    .color(theme::TEXT_DIM),
+                .color(theme::TEXT_FAINT),
             );
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new("Start export").min_size(Vec2::new(120.0, 26.0))).clicked() {
+                if ui.add(egui::Button::new("Start export").min_size(Vec2::new(130.0, 28.0))).clicked() {
                     app.begin_export();
                 }
                 if ui.button("Cancel").clicked() {
@@ -707,6 +1025,15 @@ fn export_dialog(app: &mut App, ctx: &Context) {
     if !open {
         app.show_export = false;
     }
+}
+
+fn sanitise(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '-' })
+        .collect();
+    let s = s.trim().to_string();
+    if s.is_empty() { "video".into() } else { s }
 }
 
 fn export_progress(app: &mut App, ctx: &Context) {
