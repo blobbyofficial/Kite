@@ -45,10 +45,12 @@ struct Preview {
 impl Preview {
     fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
         let state = cc.wgpu_render_state.clone()?;
+        let info = state.adapter.get_info();
         let gpu = Gpu {
             device: Arc::new(state.device.clone()),
             queue: Arc::new(state.queue.clone()),
-            adapter: format!("{} ({:?})", state.adapter.get_info().name, state.adapter.get_info().backend),
+            adapter: format!("{} ({:?})", info.name, info.backend),
+            software: crate::render::is_software(&info),
         };
         match Renderer::new(gpu) {
             Ok(renderer) => Some(Self { renderer, state, registered: None }),

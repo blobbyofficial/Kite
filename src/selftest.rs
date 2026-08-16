@@ -1252,10 +1252,7 @@ fn preview_budget_check(
 ) -> Result<()> {
     let project = parity_project(media_id, src, dur)?;
     let gpu = crate::render::Gpu::headless()?;
-    let software = {
-        let a = gpu.adapter.to_lowercase();
-        a.contains("llvmpipe") || a.contains("software") || a.contains("swiftshader") || a.contains("lavapipe")
-    };
+    let software = gpu.software;
     let mut renderer = crate::render::Renderer::new(gpu)?;
     let mut source = ProxyFrames { cache, missed: 0 };
 

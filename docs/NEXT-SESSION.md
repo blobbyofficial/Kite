@@ -189,9 +189,13 @@ Every one of these cost real time. They are fixed; do not reintroduce them.
     availability. `-vsync` is gone in ffmpeg 8; it went in unnoticed and broke the build. Pull a
     single frame by seeking, the way `frame_chroma` and `exported_frame` do, not with `select`.
     **Check the Windows run before merging to main, not after.**
-17. **An input seek discards frames whose timestamp is below the target.** Asking for the middle
+17. **The Windows runner's graphics adapter is WARP**, reported as "Microsoft Basic Render
+    Driver" — a software rasteriser that a name check for llvmpipe and SwiftShader walks straight
+    past, and it then misses a 16 ms frame budget by a factor of thirty. Ask the adapter for its
+    `DeviceType` instead of matching on its name; `render::is_software` does.
+18. **An input seek discards frames whose timestamp is below the target.** Asking for the middle
     of frame *n* returns frame *n + 1*. Seek just before the frame you want.
-18. **`sine` from lavfi is much quieter than full scale** — about 0.06 RMS after an AAC round
+19. **`sine` from lavfi is much quieter than full scale** — about 0.06 RMS after an AAC round
     trip. Audio checks written against absolute levels will fail for no reason; make them
     relative to a measured signal level, as `audio_parity_check` does.
 

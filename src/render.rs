@@ -122,6 +122,26 @@ pub struct Gpu {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub adapter: String,
+    /// True when there is no graphics hardware behind this and everything is being rasterised on
+    /// the processor — llvmpipe on a Linux runner, WARP on a Windows one. Frame-time targets are
+    /// meaningless there, so the budget gate reports instead of failing.
+    pub software: bool,
+}
+
+/// Whether an adapter is a software rasteriser.
+///
+/// Taken from the adapter's own device type rather than matched against a list of names, because
+/// the list is always missing one: "Microsoft Basic Render Driver" is WARP, and it sailed past a
+/// name check for llvmpipe and SwiftShader and then failed a 16 ms budget it was never going to
+/// meet. The name is still consulted as a backstop for drivers that misreport themselves.
+pub fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    if info.device_type == wgpu::DeviceType::Cpu {
+        return true;
+    }
+    let n = info.name.to_lowercase();
+    ["llvmpipe", "lavapipe", "swiftshader", "software", "basic render"]
+        .iter()
+        .any(|s| n.contains(s))
 }
 
 impl Gpu {
@@ -140,9 +160,9 @@ impl Gpu {
             force_fallback_adapter: false,
         }))
         .map_err(|e| anyhow!("no usable graphics adapter for rendering: {e}"))?;
-        let name = {
+        let (name, software) = {
             let i = adapter.get_info();
-            format!("{} ({:?})", i.name, i.backend)
+            (format!("{} ({:?})", i.name, i.backend), is_software(&i))
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kite-render"),
@@ -151,7 +171,7 @@ impl Gpu {
             ..Default::default()
         }))
         .context("creating a graphics device for rendering")?;
-        Ok(Self { device: Arc::new(device), queue: Arc::new(queue), adapter: name })
+        Ok(Self { device: Arc::new(device), queue: Arc::new(queue), adapter: name, software })
     }
 }
 
