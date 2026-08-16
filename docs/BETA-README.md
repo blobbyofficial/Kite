@@ -2,6 +2,20 @@
 
 A video editor built around one idea: it should stay responsive on a modest laptop.
 
+## Projects, bins and timelines
+
+Kite opens with your **projects**. Start one and it is saved into `Documents/Kite Projects`, so
+you never have to think about where it went.
+
+Inside a project, the **media pool** on the left works like Resolve's: a tree of **bins** on top,
+the contents of the selected bin below. Right-click a bin for sub-bins and renaming; right-click a
+clip to move it between bins.
+
+**Timelines live in the media pool** alongside your footage. A project can hold as many as you
+like — a main cut, a short version, a vertical version — and you switch between them by clicking
+one in the pool or using the selector above the timeline. Each can keep the project format or have
+its own.
+
 ## Getting going
 
 1. **Import** — drag video files onto the window, or press `Ctrl+I`. A clip is ready to edit
@@ -14,8 +28,10 @@ A video editor built around one idea: it should stay responsive on a modest lapt
 4. **Trim** — drag a clip's left or right edge. Drag its middle to move it, including onto
    another track.
 5. **Title** — press the `T Text` button, then edit it in the inspector on the right.
-6. **Export** — `Ctrl+E`. Export always reads your original files, never the playback proxies,
-   so the master is full quality.
+6. **Render** — `Ctrl+M` adds the timeline to the **render queue**, which works like After
+   Effects': each row has its own Output Module (size, frame rate, quality, encoder, audio) and
+   its own destination. Set them up, then press **Render** and the rows run in order. Rendering
+   always reads your original files, never the playback copies.
 
 ## Keyboard
 

@@ -4,7 +4,7 @@
 //! resolution, so what you export is the real quality regardless of what you edited against.
 
 use crate::ffmpeg::{self, Tools};
-use crate::project::{ClipSource, MediaId, Project, TextAlign, TrackKind};
+use crate::project::{ClipSource, MediaId, Project, TextAlign, Timeline, TrackKind};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -105,11 +105,11 @@ impl ExportJob {
 
 /// What sound, if any, the current timeline would contribute to an export. Shown in the export
 /// dialog so "why is there no audio" is answered before rendering rather than after.
-pub fn audio_summary(project: &Project) -> (usize, usize, bool) {
+pub fn audio_summary(project: &Project, tl: &Timeline) -> (usize, usize, bool) {
     let mut clips = 0;
     let mut silent = 0;
     let mut muted_track_has_audio = false;
-    for track in &project.tracks {
+    for track in &tl.tracks {
         for c in &track.clips {
             let has = c
                 .media_id()
@@ -305,13 +305,14 @@ impl Graph {
 /// Builds the complete `-filter_complex` string plus the ordered list of input files.
 pub fn build_graph(
     project: &Project,
+    tl: &Timeline,
     settings: &ExportSettings,
     assets: Option<&Assets>,
 ) -> Result<(Vec<PathBuf>, String, bool)> {
     let w = settings.width as i64;
     let h = settings.height as i64;
     let fps = settings.fps.max(1);
-    let total_frames = project.duration();
+    let total_frames = tl.duration();
     if total_frames <= 0 {
         bail!("the timeline is empty — add a clip before exporting");
     }
@@ -320,7 +321,7 @@ pub fn build_graph(
     // One ffmpeg input per distinct source file, reused by every clip that references it.
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut index_of: BTreeMap<MediaId, usize> = BTreeMap::new();
-    for track in &project.tracks {
+    for track in project.tracks() {
         for clip in &track.clips {
             if let Some(mid) = clip.media_id() {
                 if !index_of.contains_key(&mid) {
@@ -340,7 +341,7 @@ pub fn build_graph(
     let mut current = "bg".to_string();
 
     // Video tracks composite bottom-up, so walk them in reverse (they are stored top-first).
-    let video_tracks: Vec<_> = project
+    let video_tracks: Vec<_> = tl
         .tracks
         .iter()
         .filter(|t| t.kind == TrackKind::Video && !t.hidden)
@@ -516,7 +517,7 @@ pub fn build_graph(
 
     // --- audio ---
     let mut alabels: Vec<String> = Vec::new();
-    for track in project.tracks.iter().filter(|t| !t.muted && settings.include_audio) {
+    for track in tl.tracks.iter().filter(|t| !t.muted && settings.include_audio) {
         for (i, clip) in track.clips.iter().enumerate() {
             let tail = track
                 .clips
@@ -628,6 +629,7 @@ fn position(w: i64, h: i64, cw: i64, ch: i64, px: f32, py: f32) -> (i64, i64) {
 pub fn start(
     tools: Arc<Tools>,
     project: Project,
+    timeline: crate::project::TimelineId,
     settings: ExportSettings,
     font: Option<PathBuf>,
 ) -> ExportJob {
@@ -639,7 +641,11 @@ pub fn start(
     std::thread::Builder::new()
         .name("kite-export".into())
         .spawn(move || {
-            let total_frames = project.duration();
+            let Some(tl) = project.timeline_by_id(timeline).cloned() else {
+                let _ = tx.send(ExportMsg::Failed("that timeline no longer exists".into()));
+                return;
+            };
+            let total_frames = tl.duration();
             let assets = match Assets::prepare(font.as_deref()) {
                 Ok(a) => a,
                 Err(e) => {
@@ -647,7 +653,7 @@ pub fn start(
                     return;
                 }
             };
-            let res = run_export(&tools, &project, &s2, &assets, total_frames, &tx, &c2);
+            let res = run_export(&tools, &project, &tl, &s2, &assets, total_frames, &tx, &c2);
             assets.cleanup();
             match res {
                 Ok(()) => {
@@ -678,13 +684,14 @@ pub fn start(
 fn run_export(
     tools: &Tools,
     project: &Project,
+    tl: &Timeline,
     settings: &ExportSettings,
     assets: &Assets,
     total_frames: i64,
     tx: &crossbeam_channel::Sender<ExportMsg>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let (inputs, graph, has_audio) = build_graph(project, settings, Some(assets))?;
+    let (inputs, graph, has_audio) = build_graph(project, tl, settings, Some(assets))?;
 
     let mut cmd = ffmpeg::command(&tools.ffmpeg);
     // Everything the filtergraph names is in here, referenced without a path.

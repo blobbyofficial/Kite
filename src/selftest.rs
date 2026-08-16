@@ -66,7 +66,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     let importer = Importer::new(tools.clone(), dir.join("cache"), 2);
     step!("probing and preparing");
     let t0 = Instant::now();
-    importer.submit(media_id, src.clone(), project.settings.fps, 540);
+    importer.submit(media_id, src.clone(), project.seq().fps, 540);
 
     let mut video_dir = None;
     let mut audio_path = None;
@@ -112,7 +112,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         media: media_id,
         path: src.clone(),
         dir: video_dir.clone().context("no span directory")?,
-        fps: project.settings.fps,
+        fps: project.seq().fps,
         height: 540,
         total_frames: frames,
     });
@@ -177,17 +177,18 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         peaks_path: None,
         state: ImportState::Ready,
         error: None,
+        bin: 0,
     });
 
     let v_track = project
-        .tracks
+        .tracks()
         .iter()
         .filter(|t| t.kind == TrackKind::Video)
         .last()
         .map(|t| t.id)
         .context("no video track")?;
     let v_top = project
-        .tracks
+        .tracks()
         .iter()
         .find(|t| t.kind == TrackKind::Video)
         .map(|t| t.id)
@@ -223,7 +224,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     if project.duration() != 90 {
         bail!("timeline duration is {} frames, expected 90", project.duration());
     }
-    pass!("timeline: {} clips, {} frames", project.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), project.duration());
+    pass!("timeline: {} clips, {} frames", project.tracks().iter().map(|t| t.clips.len()).sum::<usize>(), project.duration());
 
     // Round-trip the document to make sure projects actually reload.
     let pfile = dir.join("test.kite");
@@ -239,9 +240,9 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         path: out.clone(),
         encoder: Encoder::X264,
         quality: Quality::Balanced,
-        width: project.settings.width,
-        height: project.settings.height,
-        fps: project.settings.fps,
+        width: project.seq().width,
+        height: project.seq().height,
+        fps: project.seq().fps,
         include_audio: true,
     };
     let font = find_font();
@@ -250,7 +251,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     }
     let assets = export::Assets::prepare(font.as_deref())?;
     verify_titles_render(&tools, &assets)?;
-    let (inputs, graph, has_audio) = export::build_graph(&project, &settings, Some(&assets))?;
+    let (inputs, graph, has_audio) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
     if inputs.len() != 1 {
         bail!("expected one input file, got {}", inputs.len());
     }
@@ -266,7 +267,7 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
 
     assets.cleanup();
     let t0 = Instant::now();
-    let job = export::start(tools.clone(), project.clone(), settings, font.clone());
+    let job = export::start(tools.clone(), project.clone(), project.tl().id, settings, font.clone());
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         if Instant::now() > deadline {
@@ -327,14 +328,14 @@ pub fn export_cli(tools: Arc<Tools>, project_path: &str, out: &str) -> Result<()
         path: std::path::PathBuf::from(out),
         encoder: Encoder::X264,
         quality: Quality::High,
-        width: project.settings.width,
-        height: project.settings.height,
-        fps: project.settings.fps,
+        width: project.seq().width,
+        height: project.seq().height,
+        fps: project.seq().fps,
         include_audio: true,
     };
     let font = find_font();
     let assets = export::Assets::prepare(font.as_deref())?;
-    let (inputs, graph, has_audio) = export::build_graph(&project, &settings, Some(&assets))?;
+    let (inputs, graph, has_audio) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
     assets.cleanup();
     println!("inputs: {inputs:#?}");
     println!("has_audio: {has_audio}");
@@ -490,7 +491,7 @@ fn dissolve_check(
     let media_id = project.alloc_id();
     project.media.push(media_item(media_id, src, dur));
     let tid = project
-        .tracks
+        .tracks()
         .iter()
         .filter(|t| t.kind == TrackKind::Video)
         .last()
@@ -552,6 +553,7 @@ fn media_item(id: u64, src: &std::path::Path, dur: f64) -> MediaItem {
         peaks_path: None,
         state: ImportState::Ready,
         error: None,
+        bin: 0,
     }
 }
 
@@ -567,7 +569,7 @@ fn speed_check(
     let media_id = project.alloc_id();
     project.media.push(media_item(media_id, src, dur));
     let tid = project
-        .tracks
+        .tracks()
         .iter()
         .filter(|t| t.kind == TrackKind::Video)
         .last()
@@ -613,7 +615,8 @@ fn run_export_blocking(
     project: Project,
     settings: ExportSettings,
 ) -> Result<()> {
-    let job = export::start(tools.clone(), project, settings, None);
+    let tl = project.tl().id;
+    let job = export::start(tools.clone(), project, tl, settings, None);
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         if Instant::now() > deadline {
@@ -637,7 +640,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
     let media_id = project.alloc_id();
     project.media.push(media_item(media_id, src, dur));
     let tid = project
-        .tracks
+        .tracks()
         .iter()
         .filter(|t| t.kind == TrackKind::Video)
         .last()
@@ -660,7 +663,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
             include_audio: true,
     };
     let assets = export::Assets::prepare(None)?;
-    let (_, graph, _) = export::build_graph(&project, &settings, Some(&assets))?;
+    let (_, graph, _) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
     assets.cleanup();
     let len = graph.len();
     if len < 32_768 {
@@ -684,7 +687,7 @@ fn scale_check() -> Result<()> {
     const CLIPS: i64 = 10_000;
     let mut project = Project::default();
     let tid = project
-        .tracks
+        .tracks()
         .iter()
         .find(|t| t.kind == TrackKind::Video)
         .map(|t| t.id)

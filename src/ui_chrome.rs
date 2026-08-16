@@ -2,7 +2,7 @@
 
 use crate::app::{App, PROXY_HEIGHTS};
 use crate::export::Quality;
-use crate::project::{timecode, ClipSource, ImportState, MediaId, TextAlign, TrackKind};
+use crate::project::{timecode, ClipSource, ImportState, MediaId, RenderStatus, TextAlign, TrackKind};
 use crate::project::ColorAdjust;
 use crate::theme;
 use egui::{Align, Align2, Color32, Context, CornerRadius, Layout, Pos2, Rect, Sense, Vec2};
@@ -34,8 +34,12 @@ pub fn top_bar(app: &mut App, ctx: &Context) {
                         app.import_dialog();
                         ui.close();
                     }
-                    if ui.button("Export video…      Ctrl+E").clicked() {
-                        app.show_export = true;
+                    if ui.button("Add to render queue   Ctrl+M").clicked() {
+                        app.add_to_render_queue();
+                        ui.close();
+                    }
+                    if ui.button("Render queue…").clicked() {
+                        app.show_render_queue = true;
                         ui.close();
                     }
                     ui.separator();
@@ -146,11 +150,11 @@ pub fn top_bar(app: &mut App, ctx: &Context) {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new("Export").min_size(Vec2::new(74.0, 24.0)))
-                        .on_hover_text("Render the finished video   Ctrl+E")
+                        .add(egui::Button::new("Render").min_size(Vec2::new(74.0, 24.0)))
+                        .on_hover_text("Queue this timeline and open the render queue   Ctrl+M")
                         .clicked()
                     {
-                        app.show_export = true;
+                        app.add_to_render_queue();
                     }
                     if ui
                         .button("Import media")
@@ -164,48 +168,158 @@ pub fn top_bar(app: &mut App, ctx: &Context) {
         });
 }
 
+/// The media pool: a bin tree above, the contents of the selected bin below.
+///
+/// Timelines are items in the pool alongside footage, the way Resolve treats them, so a project
+/// can hold several sequences and you switch by opening one.
 pub fn media_panel(app: &mut App, ctx: &Context) {
     egui::SidePanel::left("media")
         .resizable(true)
-        .default_width(230.0)
-        .width_range(170.0..=400.0)
+        .default_width(268.0)
+        .width_range(200.0..=460.0)
         .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::same(8)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MEDIA").font(theme::mono(11.0)).color(theme::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new("MEDIA POOL")
+                        .font(theme::mono(10.0))
+                        .color(theme::TEXT_FAINT),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("+").on_hover_text("Import media").clicked() {
+                    if ui.small_button("Import").on_hover_text("Add footage   Ctrl+I").clicked() {
                         app.import_dialog();
                     }
                 });
             });
             ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.small_button("New bin").clicked() {
+                    let parent = app.active_bin;
+                    app.snapshot();
+                    let id = app.project.add_bin("New bin", Some(parent));
+                    app.active_bin = id;
+                }
+                if ui.small_button("New timeline").clicked() {
+                    app.show_new_timeline = true;
+                    app.new_timeline_name = format!("Timeline {}", app.project.timelines.len() + 1);
+                }
+            });
 
-            if app.project.media.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("Drop video files here").color(theme::TEXT_DIM));
-                    ui.add_space(6.0);
-                    if ui.button("Import media…").clicked() {
-                        app.import_dialog();
-                    }
+            ui.add_space(6.0);
+            // ---- bin tree ----
+            egui::ScrollArea::vertical()
+                .id_salt("bins")
+                .max_height(112.0)
+                .show(ui, |ui| {
+                    let root = app.project.root_bin();
+                    draw_bin(app, ui, root, 0);
                 });
-                return;
-            }
+
+            ui.add_space(4.0);
+            ui.separator();
+
+            let bin = app.active_bin;
+            let bin_name = app
+                .project
+                .bins
+                .iter()
+                .find(|b| b.id == bin)
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| "Master".into());
+            ui.label(
+                egui::RichText::new(bin_name.to_uppercase())
+                    .font(theme::mono(9.5))
+                    .color(theme::TEXT_FAINT),
+            );
 
             let mut to_insert: Option<MediaId> = None;
             let mut to_remove: Option<MediaId> = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let items: Vec<_> = app.project.media.iter().map(|m| {
-                    (m.id, m.name.clone(), m.state, m.duration, m.has_video, m.has_audio,
-                     m.error.clone(), m.audio_path.is_some())
-                }).collect();
+            let mut to_open: Option<u64> = None;
+            let mut move_to: Option<(MediaId, u64)> = None;
+            let bins: Vec<(u64, String)> =
+                app.project.bins.iter().map(|b| (b.id, b.name.clone())).collect();
+
+            egui::ScrollArea::vertical().id_salt("pool").show(ui, |ui| {
+                // Timelines first: they are what you open, not what you drag in.
+                let tls: Vec<(u64, String, usize, i64)> = app
+                    .project
+                    .timelines
+                    .iter()
+                    .filter(|t| t.bin == bin)
+                    .map(|t| (t.id, t.name.clone(), t.tracks.len(), t.duration()))
+                    .collect();
+                let active_id = app.project.tl().id;
+                for (id, name, ntracks, dur) in tls {
+                    let resp =
+                        ui.allocate_response(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                    let r = resp.rect;
+                    let on = id == active_id;
+                    let bg = if on {
+                        theme::ACCENT_DIM
+                    } else if resp.hovered() {
+                        theme::PANEL_HI
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(r, CornerRadius::same(3), bg);
+                    let ic = Rect::from_center_size(
+                        Pos2::new(r.left() + 15.0, r.center().y),
+                        Vec2::new(15.0, 11.0),
+                    );
+                    ui.painter().rect_filled(ic, CornerRadius::same(2), theme::ACCENT);
+                    ui.painter().text(
+                        Pos2::new(r.left() + 28.0, r.top() + 3.0),
+                        Align2::LEFT_TOP,
+                        &name,
+                        theme::ui_font(11.5),
+                        theme::TEXT,
+                    );
+                    ui.painter().text(
+                        Pos2::new(r.left() + 28.0, r.bottom() - 3.0),
+                        Align2::LEFT_BOTTOM,
+                        format!("timeline · {ntracks} tracks · {}", timecode(dur, app.fps())),
+                        theme::mono(9.0),
+                        theme::TEXT_FAINT,
+                    );
+                    if resp.clicked() || resp.double_clicked() {
+                        to_open = Some(id);
+                    }
+                }
+
+                let items: Vec<_> = app
+                    .project
+                    .media
+                    .iter()
+                    .filter(|m| m.bin == bin)
+                    .map(|m| {
+                        (
+                            m.id,
+                            m.name.clone(),
+                            m.state,
+                            m.duration,
+                            m.has_video,
+                            m.has_audio,
+                            m.error.clone(),
+                            m.audio_path.is_some(),
+                        )
+                    })
+                    .collect();
+
+                if items.is_empty() && to_open.is_none() {
+                    ui.add_space(10.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Drop footage here")
+                                .color(theme::TEXT_FAINT)
+                                .size(11.5),
+                        );
+                    });
+                }
+
                 for (id, name, state, duration, has_v, has_a, err, audio_ready) in items {
                     let selected = app.selected_media == Some(id);
-                    let resp = ui.allocate_response(
-                        Vec2::new(ui.available_width(), 40.0),
-                        Sense::click(),
-                    );
+                    let resp =
+                        ui.allocate_response(Vec2::new(ui.available_width(), 40.0), Sense::click());
                     let r = resp.rect;
                     let bg = if selected {
                         theme::ACCENT_DIM
@@ -216,8 +330,6 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                     };
                     ui.painter().rect_filled(r, CornerRadius::same(3), bg);
 
-                    // Drawn rather than typed: glyphs for these fall back to tofu in the
-                    // default font set.
                     let ic = Rect::from_center_size(
                         Pos2::new(r.left() + 15.0, r.center().y),
                         Vec2::new(15.0, 11.0),
@@ -244,13 +356,13 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                         theme::ui_font(11.5),
                         theme::TEXT,
                     );
-
                     let sub = match state {
                         ImportState::Queued | ImportState::Probing => "reading…".to_string(),
                         ImportState::Building(p) => format!("preparing  {p}%"),
                         ImportState::Ready => {
                             let secs = duration.max(0.0);
-                            let len = format!("{:02}:{:05.2}", (secs / 60.0) as u32, secs % 60.0);
+                            let len =
+                                format!("{:02}:{:05.2}", (secs / 60.0) as u32, secs % 60.0);
                             if has_a && !audio_ready {
                                 format!("{len}  ·  sound…")
                             } else {
@@ -261,7 +373,7 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                     };
                     let sub_col = match state {
                         ImportState::Failed => theme::BAD,
-                        ImportState::Ready => theme::TEXT_DIM,
+                        ImportState::Ready => theme::TEXT_FAINT,
                         _ => theme::WARN,
                     };
                     ui.painter().with_clip_rect(text_rect).text(
@@ -271,14 +383,6 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                         theme::mono(9.5),
                         sub_col,
                     );
-
-                    if let ImportState::Building(p) = state {
-                        let bar = Rect::from_min_max(
-                            Pos2::new(r.left() + 28.0, r.bottom() - 2.0),
-                            Pos2::new(r.left() + 28.0 + (r.width() - 32.0) * p as f32 / 100.0, r.bottom()),
-                        );
-                        ui.painter().rect_filled(bar, CornerRadius::ZERO, theme::ACCENT);
-                    }
 
                     if resp.clicked() {
                         app.selected_media = Some(id);
@@ -291,6 +395,15 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                             to_insert = Some(id);
                             ui.close();
                         }
+                        ui.menu_button("Move to bin", |ui| {
+                            for (bid, bname) in &bins {
+                                if ui.button(bname).clicked() {
+                                    move_to = Some((id, *bid));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.separator();
                         if ui.button("Remove from project").clicked() {
                             to_remove = Some(id);
                             ui.close();
@@ -299,16 +412,17 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                 }
             });
 
-            ui.add_space(6.0);
-            let can_add = app.selected_media.is_some();
-            if ui
-                .add_enabled(can_add, egui::Button::new("Add to timeline").min_size(Vec2::new(ui.available_width(), 24.0)))
-                .on_hover_text("Or double-click an item")
-                .clicked()
-            {
-                to_insert = app.selected_media;
+            if let Some(id) = to_open {
+                app.project.activate(id);
+                app.playhead = app.playhead.min(app.duration());
+                app.mark_audio_dirty();
             }
-
+            if let Some((m, b)) = move_to {
+                app.snapshot();
+                if let Some(item) = app.project.media_mut(m) {
+                    item.bin = b;
+                }
+            }
             if let Some(id) = to_insert {
                 app.insert_media(id);
             }
@@ -316,6 +430,63 @@ pub fn media_panel(app: &mut App, ctx: &Context) {
                 app.remove_media(id);
             }
         });
+}
+
+fn draw_bin(app: &mut App, ui: &mut egui::Ui, bin: u64, depth: usize) {
+    let (name, count) = {
+        let name = app
+            .project
+            .bins
+            .iter()
+            .find(|b| b.id == bin)
+            .map(|b| b.name.clone())
+            .unwrap_or_default();
+        let count = app.project.media.iter().filter(|m| m.bin == bin).count()
+            + app.project.timelines.iter().filter(|t| t.bin == bin).count();
+        (name, count)
+    };
+    let on = app.active_bin == bin;
+    let resp = ui.allocate_response(Vec2::new(ui.available_width(), 20.0), Sense::click());
+    let r = resp.rect;
+    if on {
+        ui.painter().rect_filled(r, CornerRadius::same(3), theme::ACCENT_DIM);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(r, CornerRadius::same(3), theme::PANEL_HI);
+    }
+    let x = r.left() + 6.0 + depth as f32 * 12.0;
+    ui.painter().text(
+        Pos2::new(x, r.center().y),
+        Align2::LEFT_CENTER,
+        format!("{name}  ({count})"),
+        theme::ui_font(11.0),
+        if on { theme::TEXT } else { theme::TEXT_DIM },
+    );
+    if resp.clicked() {
+        app.active_bin = bin;
+    }
+    resp.context_menu(|ui| {
+        if ui.button("New sub-bin").clicked() {
+            app.snapshot();
+            let id = app.project.add_bin("New bin", Some(bin));
+            app.active_bin = id;
+            ui.close();
+        }
+        if ui.button("Rename…").clicked() {
+            app.rename_bin = Some(bin);
+            ui.close();
+        }
+    });
+
+    let kids: Vec<u64> = app
+        .project
+        .bins
+        .iter()
+        .filter(|b| b.parent == Some(bin))
+        .map(|b| b.id)
+        .collect();
+    for k in kids {
+        draw_bin(app, ui, k, depth + 1);
+    }
 }
 
 pub fn inspector(app: &mut App, ctx: &Context) {
@@ -350,7 +521,7 @@ pub fn inspector(app: &mut App, ctx: &Context) {
             let cid = sel[0];
             let Some((track, clip)) = app.project.clip(cid) else { return };
             let kind = track.kind;
-            let fps = app.project.settings.fps;
+            let fps = app.project.seq().fps;
             let mut c = clip.clone();
             let mut changed = false;
             let mut speed_change: Option<f32> = None;
@@ -721,10 +892,13 @@ pub fn status_bar(app: &mut App, ctx: &Context, frame_ms: f32) {
 
 pub fn overlays(app: &mut App, ctx: &Context) {
     recovery_prompt(app, ctx);
+    project_manager(app, ctx);
     new_project_dialog(app, ctx);
+    new_timeline_dialog(app, ctx);
+    rename_bin_dialog(app, ctx);
     add_track_dialog(app, ctx);
-    export_dialog(app, ctx);
-    export_progress(app, ctx);
+    render_queue_window(app, ctx);
+    output_module_dialog(app, ctx);
     shortcuts_window(app, ctx);
 }
 
@@ -753,6 +927,125 @@ fn recovery_prompt(app: &mut App, ctx: &Context) {
 
 /// The start screen. Previously a project simply appeared, already called "Untitled" and already
 /// 1920x1080 at 30fps, with no indication that any of that was a choice.
+/// The window Kite opens with: your projects, and a way to start another.
+fn project_manager(app: &mut App, ctx: &Context) {
+    if !app.show_project_manager {
+        return;
+    }
+    egui::Window::new("Projects")
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .default_height(400.0)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("New project").min_size(Vec2::new(120.0, 26.0)))
+                    .clicked()
+                {
+                    app.show_new_project = true;
+                }
+                if ui.button("Open from disk…").clicked() {
+                    app.open();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            crate::app::projects_dir().display().to_string(),
+                        )
+                        .font(theme::mono(9.5))
+                        .color(theme::TEXT_FAINT),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            ui.separator();
+
+            let projects = App::list_projects();
+            if projects.is_empty() {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("No projects yet").color(theme::TEXT_DIM).size(14.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Start one and it will appear here next time.")
+                            .color(theme::TEXT_FAINT)
+                            .size(11.5),
+                    );
+                });
+                return;
+            }
+
+            let mut open_path = None;
+            let mut delete_path = None;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (path, name, modified) in projects {
+                    let resp =
+                        ui.allocate_response(Vec2::new(ui.available_width(), 42.0), Sense::click());
+                    let r = resp.rect;
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, CornerRadius::same(4), theme::PANEL_HI);
+                    }
+                    let sw = Rect::from_min_size(
+                        Pos2::new(r.left() + 8.0, r.center().y - 11.0),
+                        Vec2::new(38.0, 22.0),
+                    );
+                    ui.painter().rect_filled(sw, CornerRadius::same(3), theme::RAISED);
+                    ui.painter().text(
+                        Pos2::new(r.left() + 56.0, r.top() + 6.0),
+                        Align2::LEFT_TOP,
+                        &name,
+                        theme::ui_font(13.0),
+                        theme::TEXT,
+                    );
+                    let ago = modified
+                        .elapsed()
+                        .map(|d| {
+                            let s = d.as_secs();
+                            if s < 3600 {
+                                format!("{} min ago", (s / 60).max(1))
+                            } else if s < 86400 {
+                                format!("{} hours ago", s / 3600)
+                            } else {
+                                format!("{} days ago", s / 86400)
+                            }
+                        })
+                        .unwrap_or_else(|_| "just now".into());
+                    ui.painter().text(
+                        Pos2::new(r.left() + 56.0, r.bottom() - 6.0),
+                        Align2::LEFT_BOTTOM,
+                        ago,
+                        theme::mono(9.5),
+                        theme::TEXT_FAINT,
+                    );
+                    if resp.clicked() || resp.double_clicked() {
+                        open_path = Some(path.clone());
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Open").clicked() {
+                            open_path = Some(path.clone());
+                            ui.close();
+                        }
+                        if ui.button(egui::RichText::new("Delete").color(theme::BAD)).clicked() {
+                            delete_path = Some(path.clone());
+                            ui.close();
+                        }
+                    });
+                }
+            });
+            if let Some(p) = open_path {
+                app.open_path(p);
+                app.show_project_manager = false;
+            }
+            if let Some(p) = delete_path {
+                std::fs::remove_file(p).ok();
+            }
+        });
+}
+
 fn new_project_dialog(app: &mut App, ctx: &Context) {
     if !app.show_new_project {
         return;
@@ -832,9 +1125,8 @@ fn new_project_dialog(app: &mut App, ctx: &Context) {
                 {
                     app.create_project();
                 }
-                if ui.button("Open a project…").clicked() {
+                if ui.button("Cancel").clicked() {
                     app.show_new_project = false;
-                    app.open();
                 }
             });
         });
@@ -882,158 +1174,469 @@ fn add_track_dialog(app: &mut App, ctx: &Context) {
         });
 }
 
-fn export_dialog(app: &mut App, ctx: &Context) {
-    if !app.show_export {
+/// The render queue, modelled on After Effects: rows you add compositions to, each with its own
+/// output settings and destination, rendered in order when you press Render.
+fn render_queue_window(app: &mut App, ctx: &Context) {
+    if !app.show_render_queue {
         return;
     }
     let mut open = true;
-    let (audio_clips, silent_clips, muted_has_audio) = crate::export::audio_summary(&app.project);
-    egui::Window::new("Export video")
+    let rendering = app.export_job.is_some();
+    egui::Window::new("Render Queue")
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(720.0)
+        .default_height(340.0)
+        .resizable(true)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Add this timeline")
+                    .on_hover_text("Queue the timeline you are editing   Ctrl+M")
+                    .clicked()
+                {
+                    app.add_to_render_queue();
+                }
+                ui.separator();
+                let any = app
+                    .project
+                    .render_queue
+                    .iter()
+                    .any(|r| r.status != RenderStatus::Off);
+                if ui
+                    .add_enabled(any && !rendering, egui::Button::new("Render"))
+                    .on_hover_text("Render every row that is not switched off")
+                    .clicked()
+                {
+                    app.render_all();
+                }
+                if ui.add_enabled(rendering, egui::Button::new("Stop")).clicked() {
+                    app.stop_rendering();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Clear finished").clicked() {
+                        app.project
+                            .render_queue
+                            .retain(|r| r.status != RenderStatus::Done);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+
+            if app.project.render_queue.is_empty() {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Nothing queued").color(theme::TEXT_DIM).size(13.0));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Add the timeline you are working on, set where it should go, then press Render.")
+                            .color(theme::TEXT_FAINT)
+                            .size(11.5),
+                    );
+                });
+                return;
+            }
+
+            let mut remove: Option<u64> = None;
+            let mut toggle: Option<u64> = None;
+            let mut choose_path: Option<u64> = None;
+            let mut edit: Option<u64> = None;
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("rq")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing(Vec2::new(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("").font(theme::mono(9.5)));
+                        for h in ["TIMELINE", "STATUS", "OUTPUT MODULE", "OUTPUT TO"] {
+                            ui.label(
+                                egui::RichText::new(h)
+                                    .font(theme::mono(9.5))
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                        ui.end_row();
+
+                        let rows: Vec<_> = app
+                            .project
+                            .render_queue
+                            .iter()
+                            .map(|r| {
+                                (
+                                    r.id,
+                                    app.project
+                                        .timeline_by_id(r.timeline)
+                                        .map(|t| t.name.clone())
+                                        .unwrap_or_else(|| "missing".into()),
+                                    r.status,
+                                    format!(
+                                        "{}×{} · {} fps · {} · {}",
+                                        r.width,
+                                        r.height,
+                                        r.fps,
+                                        match r.quality {
+                                            1 => "Balanced",
+                                            2 => "Small",
+                                            _ => "High",
+                                        },
+                                        if r.include_audio { "audio" } else { "no audio" }
+                                    ),
+                                    r.output.clone(),
+                                    r.note.clone(),
+                                )
+                            })
+                            .collect();
+
+                        for (id, tlname, status, module, out, note) in rows {
+                            let on = status != RenderStatus::Off;
+                            let mut checked = on;
+                            if ui.checkbox(&mut checked, "").changed() {
+                                toggle = Some(id);
+                            }
+                            ui.label(egui::RichText::new(tlname).size(12.0));
+
+                            let (label, col) = match status {
+                                RenderStatus::Queued => ("Queued".to_string(), theme::TEXT_DIM),
+                                RenderStatus::Rendering => (
+                                    format!("Rendering {:.0}%", app.export_pct),
+                                    theme::ACCENT,
+                                ),
+                                RenderStatus::Done => ("Done".to_string(), theme::GOOD),
+                                RenderStatus::Failed => ("Failed".to_string(), theme::BAD),
+                                RenderStatus::Off => ("Off".to_string(), theme::TEXT_FAINT),
+                            };
+                            ui.label(egui::RichText::new(label).color(col).size(12.0))
+                                .on_hover_text(if note.is_empty() { "—".into() } else { note });
+
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new(module).font(theme::mono(10.0)),
+                                ))
+                                .on_hover_text("Change the format, size and audio for this row")
+                                .clicked()
+                            {
+                                edit = Some(id);
+                            }
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Button::new(
+                                        egui::RichText::new(elide(
+                                            &out.display().to_string(),
+                                            30,
+                                        ))
+                                        .font(theme::mono(10.0)),
+                                    ))
+                                    .on_hover_text(out.display().to_string())
+                                    .clicked()
+                                {
+                                    choose_path = Some(id);
+                                }
+                                if ui.small_button("x").on_hover_text("Remove this row").clicked() {
+                                    remove = Some(id);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+
+            if app.export_job.is_some() {
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(app.export_pct / 100.0).show_percentage());
+                ui.label(
+                    egui::RichText::new(&app.export_note)
+                        .font(theme::mono(10.0))
+                        .color(theme::TEXT_FAINT),
+                );
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+
+            if let Some(id) = toggle {
+                if let Some(r) = app.project.render_queue.iter_mut().find(|r| r.id == id) {
+                    r.status = if r.status == RenderStatus::Off {
+                        RenderStatus::Queued
+                    } else {
+                        RenderStatus::Off
+                    };
+                }
+            }
+            if let Some(id) = remove {
+                app.project.render_queue.retain(|r| r.id != id);
+            }
+            if let Some(id) = edit {
+                app.editing_output = Some(id);
+            }
+            if let Some(id) = choose_path {
+                let current = app
+                    .queue_item(id)
+                    .map(|r| r.output.clone())
+                    .unwrap_or_default();
+                let name = current
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "video.mp4".into());
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("Output to")
+                    .add_filter("MP4 video", &["mp4"])
+                    .set_file_name(&name)
+                    .save_file()
+                {
+                    if let Some(r) = app.project.render_queue.iter_mut().find(|r| r.id == id) {
+                        r.output = p;
+                    }
+                }
+            }
+        });
+    if !open {
+        app.show_render_queue = false;
+    }
+}
+
+/// The per-row settings, in the shape of After Effects' Output Module.
+fn output_module_dialog(app: &mut App, ctx: &Context) {
+    let Some(id) = app.editing_output else { return };
+    let Some(item) = app.queue_item(id).cloned() else {
+        app.editing_output = None;
+        return;
+    };
+    let tl_name = app
+        .project
+        .timeline_by_id(item.timeline)
+        .map(|t| t.name.clone())
+        .unwrap_or_default();
+    let (audio_clips, silent_clips, muted_has_audio) = app
+        .project
+        .timeline_by_id(item.timeline)
+        .map(|t| crate::export::audio_summary(&app.project, t))
+        .unwrap_or((0, 0, false));
+
+    let mut open = true;
+    let mut next = item.clone();
+    egui::Window::new(format!("Output Module — {tl_name}"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_min_width(460.0);
-
-            theme::section(ui, "FILE");
-            ui.horizontal(|ui| {
-                let shown = app.export_settings.path.display().to_string();
-                ui.label(
-                    egui::RichText::new(elide(&shown, 46))
-                        .font(theme::mono(10.5))
-                        .color(theme::TEXT_DIM),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Change…").clicked() {
-                        let name = format!("{}.mp4", sanitise(&app.project.name));
-                        if let Some(p) = rfd::FileDialog::new()
-                            .set_title("Export to")
-                            .add_filter("MP4 video", &["mp4"])
-                            .set_file_name(&name)
-                            .save_file()
-                        {
-                            app.export_settings.path = p;
-                        }
-                    }
-                });
-            });
-
-            theme::section(ui, "PICTURE");
-            let mut s = app.export_settings.clone();
+            ui.set_min_width(400.0);
+            theme::section(ui, "VIDEO");
             theme::row(ui, "Size", |ui| {
-                egui::ComboBox::from_id_salt("exres")
-                    .selected_text(format!("{}×{}", s.width, s.height))
+                egui::ComboBox::from_id_salt("omres")
+                    .selected_text(format!("{}×{}", next.width, next.height))
                     .show_ui(ui, |ui| {
-                        let (pw, ph) = (app.project.settings.width, app.project.settings.height);
-                        if ui
-                            .selectable_label(s.width == pw && s.height == ph, format!("{pw}×{ph}   (sequence)"))
-                            .clicked()
-                        {
-                            s.width = pw;
-                            s.height = ph;
-                        }
                         for (w, h, name) in RESOLUTIONS {
-                            if ui.selectable_label(s.width == w && s.height == h, name).clicked() {
-                                s.width = w;
-                                s.height = h;
+                            if ui
+                                .selectable_label(next.width == w && next.height == h, name)
+                                .clicked()
+                            {
+                                next.width = w;
+                                next.height = h;
                             }
                         }
                     })
                     .response
             });
             theme::row(ui, "Frame rate", |ui| {
-                egui::ComboBox::from_id_salt("exfps")
-                    .selected_text(format!("{} fps", s.fps))
+                egui::ComboBox::from_id_salt("omfps")
+                    .selected_text(format!("{} fps", next.fps))
                     .show_ui(ui, |ui| {
                         for f in [24u32, 25, 30, 50, 60] {
-                            if ui.selectable_label(s.fps == f, format!("{f} fps")).clicked() {
-                                s.fps = f;
+                            if ui.selectable_label(next.fps == f, format!("{f} fps")).clicked() {
+                                next.fps = f;
                             }
                         }
                     })
                     .response
             });
             theme::row(ui, "Quality", |ui| {
-                egui::ComboBox::from_id_salt("exq")
-                    .selected_text(s.quality.label())
+                egui::ComboBox::from_id_salt("omq")
+                    .selected_text(match next.quality {
+                        1 => "Balanced",
+                        2 => "Small file",
+                        _ => "High — best for YouTube",
+                    })
                     .show_ui(ui, |ui| {
-                        for opt in [Quality::High, Quality::Balanced, Quality::Small] {
-                            ui.selectable_value(&mut s.quality, opt, opt.label());
+                        for (i, label) in
+                            [(0u8, "High — best for YouTube"), (1, "Balanced"), (2, "Small file")]
+                        {
+                            if ui.selectable_label(next.quality == i, label).clicked() {
+                                next.quality = i;
+                            }
                         }
                     })
                     .response
             });
             let encoders = app.encoders.clone();
             theme::row(ui, "Encoder", |ui| {
-                egui::ComboBox::from_id_salt("exenc")
-                    .selected_text(s.encoder.label())
+                egui::ComboBox::from_id_salt("omenc")
+                    .selected_text(
+                        encoders
+                            .get(next.encoder as usize)
+                            .map(|e| e.label())
+                            .unwrap_or("x264"),
+                    )
                     .show_ui(ui, |ui| {
-                        for opt in encoders {
-                            ui.selectable_value(&mut s.encoder, opt, opt.label());
+                        for (i, e) in encoders.iter().enumerate() {
+                            if ui.selectable_label(next.encoder as usize == i, e.label()).clicked() {
+                                next.encoder = i as u8;
+                            }
                         }
                     })
                     .response
             });
 
-            theme::section(ui, "SOUND");
-            ui.checkbox(&mut s.include_audio, "Include audio");
-            let (msg, col) = if !s.include_audio {
+            theme::section(ui, "AUDIO");
+            ui.checkbox(&mut next.include_audio, "Include audio");
+            let (msg, col) = if !next.include_audio {
                 ("Audio is switched off — the file will be silent.".to_string(), theme::WARN)
             } else if audio_clips == 0 && muted_has_audio {
-                (
-                    "No sound: every clip with audio is on a muted track. Unmute it with the M button."
-                        .to_string(),
-                    theme::BAD,
-                )
+                ("No sound: every clip with audio is on a muted track.".to_string(), theme::BAD)
             } else if audio_clips == 0 {
-                ("No sound: nothing on the timeline has an audio track.".to_string(), theme::WARN)
+                ("No sound: nothing on this timeline has an audio track.".to_string(), theme::WARN)
             } else if silent_clips == audio_clips {
-                ("No sound: every audio clip has its volume at zero.".to_string(), theme::BAD)
-            } else if silent_clips > 0 {
-                (
-                    format!("{audio_clips} clips with sound, {silent_clips} of them silenced"),
-                    theme::WARN,
-                )
+                ("No sound: every audio clip is at zero volume.".to_string(), theme::BAD)
             } else {
                 (format!("{audio_clips} clip(s) with sound"), theme::GOOD)
             };
             ui.label(egui::RichText::new(msg).color(col).size(11.5));
 
-            app.export_settings = s;
-
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} of timeline · reads your original files, not the playback copies",
-                    timecode(app.duration(), app.fps())
-                ))
-                .font(theme::mono(10.5))
-                .color(theme::TEXT_FAINT),
-            );
-
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new("Start export").min_size(Vec2::new(130.0, 28.0))).clicked() {
-                    app.begin_export();
-                }
-                if ui.button("Cancel").clicked() {
-                    app.show_export = false;
-                }
-            });
+            if ui.add(egui::Button::new("Done").min_size(Vec2::new(90.0, 26.0))).clicked() {
+                app.editing_output = None;
+            }
         });
+
+    if let Some(r) = app.project.render_queue.iter_mut().find(|r| r.id == id) {
+        if *r != next {
+            *r = next;
+        }
+    }
     if !open {
-        app.show_export = false;
+        app.editing_output = None;
     }
 }
 
-fn sanitise(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '-' })
-        .collect();
-    let s = s.trim().to_string();
-    if s.is_empty() { "video".into() } else { s }
+fn new_timeline_dialog(app: &mut App, ctx: &Context) {
+    if !app.show_new_timeline {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("New timeline")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            theme::row(ui, "Name", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.new_timeline_name)
+                        .desired_width(f32::INFINITY),
+                )
+            });
+            ui.add_space(6.0);
+            let p = app.project.settings;
+            ui.checkbox(&mut app.new_timeline_custom, "Use a different format for this timeline");
+            if !app.new_timeline_custom {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Project format: {}×{} at {} fps",
+                        p.width, p.height, p.fps
+                    ))
+                    .color(theme::TEXT_FAINT)
+                    .size(11.0),
+                );
+            } else {
+                let mut w = app.new_proj.width;
+                let mut h = app.new_proj.height;
+                theme::row(ui, "Size", |ui| {
+                    egui::ComboBox::from_id_salt("ntres")
+                        .selected_text(format!("{w}×{h}"))
+                        .show_ui(ui, |ui| {
+                            for (rw, rh, name) in RESOLUTIONS {
+                                if ui.selectable_label(w == rw && h == rh, name).clicked() {
+                                    w = rw;
+                                    h = rh;
+                                }
+                            }
+                        })
+                        .response
+                });
+                theme::row(ui, "Frame rate", |ui| {
+                    egui::ComboBox::from_id_salt("ntfps")
+                        .selected_text(format!("{} fps", app.new_proj.fps))
+                        .show_ui(ui, |ui| {
+                            for f in [24u32, 25, 30, 50, 60] {
+                                if ui
+                                    .selectable_label(app.new_proj.fps == f, format!("{f} fps"))
+                                    .clicked()
+                                {
+                                    app.new_proj.fps = f;
+                                }
+                            }
+                        })
+                        .response
+                });
+                app.new_proj.width = w;
+                app.new_proj.height = h;
+            }
+            ui.add_space(10.0);
+            if ui.add(egui::Button::new("Create").min_size(Vec2::new(100.0, 26.0))).clicked() {
+                app.snapshot();
+                let fmt = if app.new_timeline_custom {
+                    Some(crate::project::VideoSettings {
+                        width: app.new_proj.width,
+                        height: app.new_proj.height,
+                        fps: app.new_proj.fps,
+                    })
+                } else {
+                    None
+                };
+                let name = app.new_timeline_name.clone();
+                app.project.add_timeline(&name, fmt);
+                app.playhead = 0;
+                app.mark_audio_dirty();
+                app.show_new_timeline = false;
+            }
+        });
+    if !open {
+        app.show_new_timeline = false;
+    }
+}
+
+fn rename_bin_dialog(app: &mut App, ctx: &Context) {
+    let Some(bin) = app.rename_bin else { return };
+    let mut open = true;
+    let mut name = app
+        .project
+        .bins
+        .iter()
+        .find(|b| b.id == bin)
+        .map(|b| b.name.clone())
+        .unwrap_or_default();
+    egui::Window::new("Rename bin")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(280.0);
+            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY)).changed() {
+                if let Some(b) = app.project.bins.iter_mut().find(|b| b.id == bin) {
+                    b.name = name.clone();
+                }
+                app.dirty = true;
+            }
+            if ui.button("Done").clicked() {
+                app.rename_bin = None;
+            }
+        });
+    if !open {
+        app.rename_bin = None;
+    }
 }
 
 fn export_progress(app: &mut App, ctx: &Context) {

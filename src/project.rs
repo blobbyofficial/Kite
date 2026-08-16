@@ -81,6 +81,9 @@ pub struct MediaItem {
     pub peaks_path: Option<PathBuf>,
     pub state: ImportState,
     pub error: Option<String>,
+    /// Which media pool folder this sits in.
+    #[serde(default)]
+    pub bin: BinId,
 }
 
 impl MediaItem {
@@ -335,37 +338,218 @@ impl Track {
     }
 }
 
+pub type BinId = u64;
+pub type TimelineId = u64;
+
+/// A folder in the media pool. Bins nest, and the root ("Master") is the one with no parent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bin {
+    pub id: BinId,
+    pub name: String,
+    pub parent: Option<BinId>,
+}
+
+/// A sequence. Timelines live in bins alongside footage, so a project can hold several of them —
+/// a rough cut, a short version, a vertical version — and you switch between them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Timeline {
+    pub id: TimelineId,
+    pub name: String,
+    /// `None` means "use the project format", which is what most timelines do.
+    #[serde(default)]
+    pub format: Option<VideoSettings>,
+    pub bin: BinId,
+    pub tracks: Vec<Track>,
+}
+
+impl Timeline {
+    pub fn duration(&self) -> i64 {
+        self.tracks.iter().map(|t| t.end_frame()).max().unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderStatus {
+    Queued,
+    Rendering,
+    Done,
+    Failed,
+    /// Present in the queue but switched off, like unticking a render item.
+    Off,
+}
+
+/// One line in the render queue: what to render, how, and where it goes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderItem {
+    pub id: u64,
+    pub timeline: TimelineId,
+    pub output: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Index into the quality list; kept as a plain number so the file format does not depend on
+    /// the encoder enum.
+    pub quality: u8,
+    pub encoder: u8,
+    pub include_audio: bool,
+    pub status: RenderStatus,
+    #[serde(default)]
+    pub note: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
     pub name: String,
+    /// The default format for new timelines.
     pub settings: VideoSettings,
     pub media: Vec<MediaItem>,
-    pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub bins: Vec<Bin>,
+    #[serde(default)]
+    pub timelines: Vec<Timeline>,
+    #[serde(default)]
+    pub active: usize,
+    #[serde(default)]
+    pub render_queue: Vec<RenderItem>,
+    /// Only present in files written before timelines existed. It must keep the old key name or
+    /// an existing project would silently open with no tracks at all.
+    #[serde(default, rename = "tracks", skip_serializing)]
+    legacy_tracks: Vec<Track>,
     next_id: u64,
 }
 
 impl Default for Project {
     fn default() -> Self {
         let mut p = Self {
-            version: 1,
+            version: 2,
             name: "Untitled".into(),
             settings: VideoSettings::default(),
             media: Vec::new(),
-            tracks: Vec::new(),
+            bins: Vec::new(),
+            timelines: Vec::new(),
+            active: 0,
+            render_queue: Vec::new(),
+            legacy_tracks: Vec::new(),
             next_id: 1,
         };
-        let v2 = p.alloc_id();
-        let v1 = p.alloc_id();
-        let a1 = p.alloc_id();
-        p.tracks.push(Track::new(v2, TrackKind::Video, "V2"));
-        p.tracks.push(Track::new(v1, TrackKind::Video, "V1"));
-        p.tracks.push(Track::new(a1, TrackKind::Audio, "A1"));
+        let root = p.alloc_id();
+        p.bins.push(Bin { id: root, name: "Master".into(), parent: None });
+        let tl = p.new_timeline("Timeline 1", None);
+        p.timelines.push(tl);
         p
     }
 }
 
+pub fn default_tracks(next: &mut impl FnMut() -> u64) -> Vec<Track> {
+    vec![
+        Track::new(next(), TrackKind::Video, "V2"),
+        Track::new(next(), TrackKind::Video, "V1"),
+        Track::new(next(), TrackKind::Audio, "A1"),
+    ]
+}
+
 impl Project {
+    pub fn root_bin(&self) -> BinId {
+        self.bins
+            .iter()
+            .find(|b| b.parent.is_none())
+            .map(|b| b.id)
+            .unwrap_or(0)
+    }
+
+    pub fn new_timeline(&mut self, name: &str, format: Option<VideoSettings>) -> Timeline {
+        let id = self.alloc_id();
+        let bin = self.root_bin();
+        let mut next = || {
+            let v = self.next_id;
+            self.next_id += 1;
+            v
+        };
+        let tracks = default_tracks(&mut next);
+        Timeline { id, name: name.to_string(), format, bin, tracks }
+    }
+
+    pub fn add_timeline(&mut self, name: &str, format: Option<VideoSettings>) -> TimelineId {
+        let tl = self.new_timeline(name, format);
+        let id = tl.id;
+        self.timelines.push(tl);
+        self.active = self.timelines.len() - 1;
+        id
+    }
+
+    pub fn add_bin(&mut self, name: &str, parent: Option<BinId>) -> BinId {
+        let id = self.alloc_id();
+        let parent = parent.or_else(|| Some(self.root_bin()));
+        self.bins.push(Bin { id, name: name.to_string(), parent });
+        id
+    }
+
+    /// The timeline currently being edited. A project always has at least one.
+    pub fn tl(&self) -> &Timeline {
+        let i = self.active.min(self.timelines.len().saturating_sub(1));
+        &self.timelines[i]
+    }
+    pub fn tl_mut(&mut self) -> &mut Timeline {
+        let i = self.active.min(self.timelines.len().saturating_sub(1));
+        &mut self.timelines[i]
+    }
+    pub fn tracks(&self) -> &Vec<Track> {
+        &self.tl().tracks
+    }
+    pub fn tracks_mut(&mut self) -> &mut Vec<Track> {
+        &mut self.tl_mut().tracks
+    }
+    /// The format of the timeline being edited, which may differ from the project default.
+    pub fn seq(&self) -> VideoSettings {
+        self.tl().format.unwrap_or(self.settings)
+    }
+    pub fn timeline_by_id(&self, id: TimelineId) -> Option<&Timeline> {
+        self.timelines.iter().find(|t| t.id == id)
+    }
+    pub fn activate(&mut self, id: TimelineId) {
+        if let Some(i) = self.timelines.iter().position(|t| t.id == id) {
+            self.active = i;
+        }
+    }
+
+    /// Rebuilds a pre-timelines project into the current shape.
+    pub fn migrate(&mut self) {
+        if self.bins.is_empty() {
+            let id = self.alloc_id();
+            self.bins.push(Bin { id, name: "Master".into(), parent: None });
+        }
+        if self.timelines.is_empty() {
+            let tracks = if self.legacy_tracks.is_empty() {
+                let mut next = || {
+                    let v = self.next_id;
+                    self.next_id += 1;
+                    v
+                };
+                default_tracks(&mut next)
+            } else {
+                std::mem::take(&mut self.legacy_tracks)
+            };
+            let id = self.alloc_id();
+            let bin = self.root_bin();
+            self.timelines.push(Timeline {
+                id,
+                name: "Timeline 1".into(),
+                format: None,
+                bin,
+                tracks,
+            });
+        }
+        let root = self.root_bin();
+        for m in &mut self.media {
+            if m.bin == 0 || !self.bins.iter().any(|b| b.id == m.bin) {
+                m.bin = root;
+            }
+        }
+        self.active = self.active.min(self.timelines.len() - 1);
+        self.version = 2;
+    }
+
     pub fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -379,26 +563,26 @@ impl Project {
         self.media.iter_mut().find(|m| m.id == id)
     }
     pub fn track(&self, id: TrackId) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.id == id)
+        self.tracks().iter().find(|t| t.id == id)
     }
     pub fn track_mut(&mut self, id: TrackId) -> Option<&mut Track> {
-        self.tracks.iter_mut().find(|t| t.id == id)
+        self.tracks_mut().iter_mut().find(|t| t.id == id)
     }
 
     /// Video tracks are stored top-first, which is also compositing order (last drawn wins).
     pub fn video_tracks(&self) -> impl Iterator<Item = &Track> {
-        self.tracks.iter().filter(|t| t.kind == TrackKind::Video)
+        self.tracks().iter().filter(|t| t.kind == TrackKind::Video)
     }
     pub fn audio_tracks(&self) -> impl Iterator<Item = &Track> {
-        self.tracks.iter().filter(|t| t.kind == TrackKind::Audio)
+        self.tracks().iter().filter(|t| t.kind == TrackKind::Audio)
     }
 
     pub fn duration(&self) -> i64 {
-        self.tracks.iter().map(|t| t.end_frame()).max().unwrap_or(0)
+        self.tl().duration()
     }
 
     pub fn clip(&self, id: ClipId) -> Option<(&Track, &Clip)> {
-        for t in &self.tracks {
+        for t in self.tracks() {
             if let Some(c) = t.clips.iter().find(|c| c.id == id) {
                 return Some((t, c));
             }
@@ -406,7 +590,7 @@ impl Project {
         None
     }
     pub fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
-        for t in &mut self.tracks {
+        for t in self.tracks_mut() {
             if let Some(c) = t.clips.iter_mut().find(|c| c.id == id) {
                 return Some(c);
             }
@@ -414,14 +598,14 @@ impl Project {
         None
     }
     pub fn track_of_clip(&self, id: ClipId) -> Option<TrackId> {
-        self.tracks
+        self.tracks()
             .iter()
             .find(|t| t.clips.iter().any(|c| c.id == id))
             .map(|t| t.id)
     }
 
     pub fn selected_ids(&self) -> Vec<ClipId> {
-        self.tracks
+        self.tracks()
             .iter()
             .flat_map(|t| t.clips.iter())
             .filter(|c| c.selected)
@@ -429,7 +613,7 @@ impl Project {
             .collect()
     }
     pub fn clear_selection(&mut self) {
-        for t in &mut self.tracks {
+        for t in self.tracks_mut() {
             for c in &mut t.clips {
                 c.selected = false;
             }
@@ -464,7 +648,7 @@ impl Project {
 
     pub fn add_track(&mut self, kind: TrackKind) -> TrackId {
         let id = self.alloc_id();
-        let n = self.tracks.iter().filter(|t| t.kind == kind).count() + 1;
+        let n = self.tracks().iter().filter(|t| t.kind == kind).count() + 1;
         let name = match kind {
             TrackKind::Video => format!("V{n}"),
             TrackKind::Audio => format!("A{n}"),
@@ -472,15 +656,17 @@ impl Project {
         let t = Track::new(id, kind, name);
         // Video tracks stack upward, so new video goes on top; audio appends below.
         match kind {
-            TrackKind::Video => self.tracks.insert(0, t),
-            TrackKind::Audio => self.tracks.push(t),
+            TrackKind::Video => self.tracks_mut().insert(0, t),
+            TrackKind::Audio => self.tracks_mut().push(t),
         }
         id
     }
 
     pub fn normalize(&mut self) {
-        for t in &mut self.tracks {
-            t.normalize();
+        for tl in &mut self.timelines {
+            for t in &mut tl.tracks {
+                t.normalize();
+            }
         }
     }
 
@@ -499,6 +685,7 @@ impl Project {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         let mut p: Project = serde_json::from_str(&s)?;
+        p.migrate();
         p.normalize();
         Ok(p)
     }
@@ -590,7 +777,7 @@ mod tests {
         let a = p.new_clip(ClipSource::Color([0; 4]), 0, 30, 0);
         let b = p.new_clip(ClipSource::Color([0; 4]), 30, 30, 0);
         let (aid, bid) = (a.id, b.id);
-        let tid = p.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id;
+        let tid = p.tracks().iter().find(|t| t.kind == TrackKind::Video).unwrap().id;
         let t = p.track_mut(tid).unwrap();
         t.clips.push(a);
         t.clips.push(b);
@@ -601,6 +788,39 @@ mod tests {
     }
 
     #[test]
+    fn a_project_saved_before_timelines_existed_keeps_its_tracks() {
+        // Exactly the shape Kite wrote before timelines were introduced.
+        let json = r#"{"version":1,"name":"old","settings":{"width":1920,"height":1080,"fps":30},
+            "media":[],"tracks":[{"id":1,"kind":"Video","name":"V1","muted":false,"hidden":false,
+            "locked":false,"height":64.0,"clips":[{"id":2,"source":{"Color":[1,2,3,255]},
+            "start":0,"len":90,"src_in":0,"volume":1.0,"opacity":1.0,"scale":1.0,"pos_x":0.0,
+            "pos_y":0.0,"fade_in":0,"fade_out":0,"selected":false}]}],"next_id":3}"#;
+        let mut p: Project = serde_json::from_str(json).expect("legacy project should parse");
+        p.migrate();
+        assert_eq!(p.timelines.len(), 1, "the old tracks should become one timeline");
+        assert_eq!(p.tracks().len(), 1, "the track itself must survive");
+        assert_eq!(p.duration(), 90, "and so must the clip on it");
+        assert_eq!(p.bins.len(), 1, "a master bin is created");
+        assert_eq!(p.tl().bin, p.root_bin());
+    }
+
+    #[test]
+    fn a_saved_project_round_trips_through_the_new_format() {
+        let mut p = Project::default();
+        let bin = p.add_bin("B-roll", None);
+        p.add_timeline("Vertical", Some(VideoSettings { width: 1080, height: 1920, fps: 30 }));
+        let c = p.new_clip(ClipSource::Color([0; 4]), 0, 45, 0);
+        p.tracks_mut()[0].clips.push(c);
+        let json = serde_json::to_string(&p).unwrap();
+        let mut back: Project = serde_json::from_str(&json).unwrap();
+        back.migrate();
+        assert_eq!(back.timelines.len(), 2);
+        assert_eq!(back.seq().width, 1080, "the timeline keeps its own format");
+        assert_eq!(back.duration(), 45);
+        assert!(back.bins.iter().any(|b| b.id == bin && b.name == "B-roll"));
+    }
+
+    #[test]
     fn old_projects_without_the_new_fields_still_load() {
         // A project written before transitions, colour and speed existed.
         let json = r#"{"version":1,"name":"old","settings":{"width":1920,"height":1080,"fps":30},
@@ -608,8 +828,9 @@ mod tests {
             "locked":false,"height":64.0,"clips":[{"id":2,"source":{"Color":[0,0,0,255]},
             "start":0,"len":30,"src_in":0,"volume":1.0,"opacity":1.0,"scale":1.0,"pos_x":0.0,
             "pos_y":0.0,"fade_in":0,"fade_out":0,"selected":false}]}],"next_id":3}"#;
-        let p: Project = serde_json::from_str(json).expect("legacy project should still parse");
-        let c = &p.tracks[0].clips[0];
+        let mut p: Project = serde_json::from_str(json).expect("legacy project should still parse");
+        p.migrate();
+        let c = &p.tracks()[0].clips[0];
         assert_eq!(c.transition_in, 0);
         assert_eq!(c.speed, 1.0);
         assert!(c.color.is_neutral());

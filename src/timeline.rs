@@ -38,7 +38,50 @@ pub fn panel(app: &mut App, ctx: &Context) {
 /// The first version put everything in one flat row — cutting tools, view toggles and "add track"
 /// side by side — which made it impossible to find anything by category.
 fn toolbar(app: &mut App, ui: &mut egui::Ui) {
-    let has_sel = app.project.tracks.iter().any(|t| t.clips.iter().any(|c| c.selected));
+    let has_sel = app.project.tracks().iter().any(|t| t.clips.iter().any(|c| c.selected));
+    // Which sequence you are editing, and a way to switch — a project can hold several.
+    let cur = app.project.tl().name.clone();
+    let items: Vec<(u64, String)> = app
+        .project
+        .timelines
+        .iter()
+        .map(|t| (t.id, t.name.clone()))
+        .collect();
+    let active = app.project.tl().id;
+    let mut switch = None;
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        egui::ComboBox::from_id_salt("tlpick")
+            .selected_text(egui::RichText::new(&cur).size(12.0))
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                for (id, name) in &items {
+                    if ui.selectable_label(*id == active, name).clicked() {
+                        switch = Some(*id);
+                    }
+                }
+                ui.separator();
+                if ui.button("New timeline…").clicked() {
+                    app.show_new_timeline = true;
+                }
+            });
+        ui.label(
+            egui::RichText::new(format!(
+                "{}×{} · {} fps",
+                app.project.seq().width,
+                app.project.seq().height,
+                app.project.seq().fps
+            ))
+            .font(theme::mono(10.0))
+            .color(theme::TEXT_FAINT),
+        );
+    });
+    if let Some(id) = switch {
+        app.project.activate(id);
+        app.playhead = app.playhead.min(app.duration());
+        app.mark_audio_dirty();
+    }
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         if ui.button("Split").on_hover_text("Cut every clip at the playhead   S").clicked() {
@@ -138,7 +181,7 @@ fn ensure_thumbs(app: &mut App, ctx: &Context, lane: Rect, tracks_rect: Rect) {
     let first = frame_at(app, lane, lane.left()) - 1;
     let last = frame_at(app, lane, lane.right()) + 1;
 
-    for t in &app.project.tracks {
+    for t in app.project.tracks() {
         let h = t.height;
         if y > tracks_rect.bottom() {
             break;
@@ -147,7 +190,7 @@ fn ensure_thumbs(app: &mut App, ctx: &Context, lane: Rect, tracks_rect: Rect) {
             y += h;
             continue;
         }
-        let tw = (h - 6.0) * app.project.settings.aspect();
+        let tw = (h - 6.0) * app.project.seq().aspect();
         if tw >= 8.0 {
             let step = thumb_step(app.px_per_frame, tw);
             for c in &t.clips {
@@ -220,7 +263,7 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
     let max_scroll = (app.duration() as f32 * app.px_per_frame - lane_rect.width() + 200.0).max(0.0);
     app.scroll_x = app.scroll_x.clamp(0.0, max_scroll);
 
-    let content_h: f32 = app.project.tracks.iter().map(|t| t.height).sum();
+    let content_h: f32 = app.project.tracks().iter().map(|t| t.height).sum();
     let max_scroll_y = (content_h - tracks_rect.height()).max(0.0);
     app.scroll_y = app.scroll_y.clamp(0.0, max_scroll_y);
 
@@ -246,7 +289,7 @@ fn body(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
     let mut y = tracks_rect.top() - app.scroll_y;
     let track_ids: Vec<(TrackId, f32)> = app
         .project
-        .tracks
+        .tracks()
         .iter()
         .map(|t| (t.id, t.height))
         .collect();
@@ -585,7 +628,7 @@ fn draw_track(
         // Thumbnails first, so the waveform and label sit on top of them.
         if track.kind == TrackKind::Video && cr.height() >= 34.0 {
             if let Some(mid) = c.media_id() {
-                let tw = (cr.height() - 4.0) * app.project.settings.aspect();
+                let tw = (cr.height() - 4.0) * app.project.seq().aspect();
                 if tw >= 8.0 {
                     let step = thumb_step(app.px_per_frame, tw);
                     let strip = painter.with_clip_rect(cr.shrink(1.0));
@@ -813,7 +856,7 @@ fn handle_interaction(
                 // Everything else that is selected travels with the grabbed clip.
                 let others: Vec<(ClipId, i64)> = if kind == DragKind::Move {
                     app.project
-                        .tracks
+                        .tracks()
                         .iter()
                         .filter(|t| !t.locked)
                         .flat_map(|t| t.clips.iter())
@@ -856,7 +899,7 @@ fn handle_interaction(
 
             let mut top = tracks_rect.top() - app.scroll_y;
             let mut hits: Vec<ClipId> = Vec::new();
-            for t in &app.project.tracks {
+            for t in app.project.tracks() {
                 let bottom = top + t.height;
                 if bottom > sel.top() && top < sel.bottom() && !t.locked {
                     for c in &t.clips {
@@ -867,7 +910,7 @@ fn handle_interaction(
                 }
                 top = bottom;
             }
-            for t in &mut app.project.tracks {
+            for t in app.project.tracks_mut() {
                 for c in &mut t.clips {
                     if hits.contains(&c.id) {
                         c.selected = true;
@@ -1046,7 +1089,7 @@ fn handle_interaction(
 
 fn track_at_y(app: &App, tracks_rect: Rect, y: f32) -> Option<TrackId> {
     let mut top = tracks_rect.top() - app.scroll_y;
-    for t in &app.project.tracks {
+    for t in app.project.tracks() {
         if y >= top && y < top + t.height {
             return Some(t.id);
         }
