@@ -27,6 +27,8 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     println!("  ffmpeg  {}", tools.ffmpeg.display());
     println!("  ffprobe {}", tools.ffprobe.display());
 
+    gpu_backend_check()?;
+
     let dir = std::env::temp_dir().join(format!("kite-selftest-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("source.mp4");
@@ -307,6 +309,43 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
 
     std::fs::remove_dir_all(&dir).ok();
     println!("\nAll checks passed.");
+    Ok(())
+}
+
+/// Confirms the binary was actually built with a graphics backend.
+///
+/// This exists because it once was not: `default-features = false` on eframe left wgpu with no
+/// backend compiled in, and the application aborted the instant it tried to open a window. Every
+/// other check passed, because none of them open one. Checking the compiled feature set catches
+/// that without needing a display.
+fn gpu_backend_check() -> Result<()> {
+    let backends = wgpu::Instance::enabled_backend_features();
+    if backends.is_empty() {
+        bail!(
+            "no GPU backends are compiled into this binary — it would abort on launch with \
+             \"No wgpu backend feature that is implemented for the target platform was enabled\". \
+             Check the wgpu feature list in Cargo.toml."
+        );
+    }
+    // Whether a usable adapter exists depends on the machine; a CI runner may legitimately have
+    // none, so that is reported rather than failed on.
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(backends);
+    let names: Vec<String> = adapters
+        .iter()
+        .map(|a| {
+            let info = a.get_info();
+            format!("{} ({:?})", info.name, info.backend)
+        })
+        .collect();
+    if names.is_empty() {
+        println!("  --  backends {backends:?} compiled in, but this machine exposes no adapter");
+    } else {
+        pass!("GPU backends {:?}, adapters: {}", backends, names.join(", "));
+    }
     Ok(())
 }
 
