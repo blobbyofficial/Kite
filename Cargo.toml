@@ -28,6 +28,11 @@ wgpu = { version = "27", default-features = false, features = ["vulkan", "dx12",
 # 0.58. If a future `cargo update` regresses it, the Windows build fails with "multiple different
 # versions of crate `windows`".
 rfd = "0.15"
+# Titles are rasterised once, by us, for both the preview and the export. ab_glyph is already
+# in the tree underneath egui, so this costs nothing new.
+ab_glyph = "0.2"
+# Blocking on device and adapter requests during startup and export; wgpu is async-first.
+pollster = "0.4"
 cpal = "0.16"
 zune-jpeg = "0.5"
 serde = { version = "1", features = ["derive"] }

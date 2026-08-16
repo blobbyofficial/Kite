@@ -6,9 +6,10 @@ use crate::export::{self, Encoder, ExportJob, ExportMsg, ExportSettings, Quality
 use crate::ffmpeg::Tools;
 use crate::import::{ImportMsg, Importer};
 use crate::proxy::{ProxyBuilder, ProxySource};
+use crate::render::{plan_frame, FrameSource, Gpu, Renderer};
 use crate::project::{
-    timecode, Clip, ClipId, ClipSource, ColorAdjust, History, ImportState, MediaId, MediaItem,
-    Project, RenderItem, RenderStatus, TextProps, Track, TrackId, TrackKind, VideoSettings,
+    timecode, Clip, ClipId, ClipSource, History, ImportState, MediaId, MediaItem, Project,
+    RenderItem, RenderStatus, TextProps, TrackId, TrackKind, VideoSettings,
 };
 use crate::theme;
 use egui::{Align2, Color32, Context, CornerRadius, Rect, Stroke, StrokeKind, Vec2};
@@ -28,11 +29,93 @@ pub enum DragKind {
     TrimEnd,
 }
 
-/// A preview texture plus a fingerprint of what is currently in it, so an idle window re-uploads
-/// nothing at all.
-struct TexSlot {
-    handle: egui::TextureHandle,
-    key: u64,
+/// The preview's end of the render graph.
+///
+/// It renders on the window's own graphics device, so the composited frame never leaves the GPU:
+/// it is handed to egui as a texture rather than read back and re-uploaded.
+struct Preview {
+    renderer: Renderer,
+    state: eframe::egui_wgpu::RenderState,
+    /// The registered egui texture and the size it was registered at. The display target is only
+    /// rebuilt when the preview changes size, so re-registering is rare.
+    registered: Option<(egui::TextureId, u32, u32)>,
+}
+
+impl Preview {
+    fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
+        let state = cc.wgpu_render_state.clone()?;
+        let gpu = Gpu {
+            device: Arc::new(state.device.clone()),
+            queue: Arc::new(state.queue.clone()),
+            adapter: format!("{} ({:?})", state.adapter.get_info().name, state.adapter.get_info().backend),
+        };
+        match Renderer::new(gpu) {
+            Ok(renderer) => Some(Self { renderer, state, registered: None }),
+            Err(e) => {
+                eprintln!("the preview renderer could not start: {e:#}");
+                None
+            }
+        }
+    }
+
+    fn draw(
+        &mut self,
+        plan: &crate::render::FramePlan,
+        source: &mut dyn FrameSource,
+    ) -> Option<egui::TextureId> {
+        if let Err(e) = self.renderer.render(plan, source) {
+            eprintln!("preview render failed: {e:#}");
+            return None;
+        }
+        let view = self.renderer.to_display_texture()?.clone();
+        let size = (plan.width, plan.height);
+        match self.registered {
+            Some((id, w, h)) if (w, h) == size => Some(id),
+            other => {
+                if let Some((id, _, _)) = other {
+                    self.state.renderer.write().free_texture(&id);
+                }
+                let id = self.state.renderer.write().register_native_texture(
+                    &self.state.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                );
+                self.registered = Some((id, size.0, size.1));
+                Some(id)
+            }
+        }
+    }
+}
+
+/// Feeds the render graph from the proxy cache.
+///
+/// During a scrub or playback it takes whatever is already decoded rather than stall the frame,
+/// and holds the last good picture while a span is still being prepared instead of going black —
+/// which is the behaviour the CPU preview had, kept.
+struct CacheFrames<'a> {
+    cache: &'a FrameCache,
+    impatient: bool,
+    preparing: bool,
+}
+
+impl FrameSource for CacheFrames<'_> {
+    fn frame(
+        &mut self,
+        _clip: ClipId,
+        media: MediaId,
+        src_frame: i64,
+    ) -> Option<Arc<crate::decode::DecodedFrame>> {
+        let f = src_frame.max(0) as u32;
+        let exact = if self.impatient {
+            self.cache.peek(media, f).or_else(|| self.cache.get(media, f))
+        } else {
+            self.cache.get(media, f)
+        };
+        if exact.is_none() {
+            self.preparing = true;
+        }
+        exact.or_else(|| self.cache.last_good(media))
+    }
 }
 
 /// The sequence a new project will be created with.
@@ -98,9 +181,7 @@ pub struct App {
     pub drag: Option<DragState>,
     pub scrubbing: bool,
 
-    tex: Vec<TexSlot>,
-    /// Scratch buffer for colour correction, reused across frames.
-    adjust_buf: Vec<u8>,
+    preview: Option<Preview>,
     thumbs: HashMap<(MediaId, u32), egui::TextureHandle>,
     thumb_order: Vec<(MediaId, u32)>,
     pcm: HashMap<MediaId, Arc<Mmap>>,
@@ -164,6 +245,7 @@ impl App {
         // Roughly a quarter of a small machine's RAM budget, capped so we never page.
         let cache = FrameCache::new(384 * 1024 * 1024, (cores / 2).clamp(1, 3), proxy.clone());
         let encoders = export::available_encoders(&tools);
+        let preview = Preview::new(cc);
 
         let project = Project::default();
         let export_settings = ExportSettings {
@@ -200,8 +282,7 @@ impl App {
             sequence_locked: false,
             drag: None,
             scrubbing: false,
-            tex: Vec::new(),
-            adjust_buf: Vec::new(),
+            preview,
             thumbs: HashMap::new(),
             thumb_order: Vec::new(),
             pcm: HashMap::new(),
@@ -1407,8 +1488,7 @@ impl App {
         }
 
         self.stop();
-        let font = export_font();
-        let job = export::start(self.tools.clone(), self.project.clone(), tid, settings, font);
+        let job = export::start(self.tools.clone(), self.project.clone(), tid, settings);
         self.export_job = Some(job);
         self.rendering = Some(id);
         self.export_pct = 0.0;
@@ -1459,14 +1539,12 @@ impl App {
             return;
         }
         self.stop();
-        let font = export_font();
         let tl = self.project.tl().id;
         let job = export::start(
             self.tools.clone(),
             self.project.clone(),
             tl,
             self.export_settings.clone(),
-            font,
         );
         self.export_job = Some(job);
         self.export_pct = 0.0;
@@ -1637,7 +1715,8 @@ impl App {
         let painter = ui.painter_at(avail);
         painter.rect_filled(avail, CornerRadius::ZERO, theme::BG);
 
-        let aspect = self.project.seq().aspect();
+        let seq = self.project.seq();
+        let aspect = seq.aspect();
         let mut w = avail.width() - 16.0;
         let mut h = w / aspect;
         if h > avail.height() - 16.0 {
@@ -1650,144 +1729,44 @@ impl App {
         let frame_rect = Rect::from_center_size(avail.center(), Vec2::new(w, h));
         painter.rect_filled(frame_rect, CornerRadius::ZERO, Color32::BLACK);
 
+        // Render at the size the preview is actually shown at, never above the sequence, so a
+        // small window costs a small render. Everything in a plan is expressed as a fraction of
+        // the frame, so the result is the same picture at whatever resolution it is asked for.
+        let ppp = ui.ctx().pixels_per_point();
+        let rw = even((w * ppp).round() as u32).clamp(16, even(seq.width).max(16));
+        let rh = even((rw as f32 / aspect).round() as u32).max(16);
+
         let f = self.playhead;
-        let mut layer = 0usize;
+        let plan = plan_frame(self.project.tl(), f, rw, rh);
+        let mut source = CacheFrames {
+            cache: &self.cache,
+            impatient: self.scrubbing || self.playing,
+            preparing: false,
+        };
+        let drawn = self
+            .preview
+            .as_mut()
+            .and_then(|p| p.draw(&plan, &mut source));
+        let mut preparing = source.preparing;
 
-        // Collect what to draw first so we are not holding a borrow of the project while
-        // mutating the texture pool.
-        struct Draw {
-            media: Option<MediaId>,
-            src: u32,
-            alpha: f32,
-            scale: f32,
-            px: f32,
-            py: f32,
-            color: ColorAdjust,
-            solid: Option<[u8; 4]>,
-            text: Option<TextProps>,
-        }
-        impl Draw {
-            fn from_clip(c: &Clip, f: i64, alpha: f32) -> Self {
-                Self {
-                    media: c.media_id(),
-                    src: c.source_frame(f).max(0) as u32,
-                    alpha,
-                    scale: c.scale,
-                    px: c.pos_x,
-                    py: c.pos_y,
-                    color: c.color,
-                    solid: match &c.source {
-                        ClipSource::Color(v) => Some(*v),
-                        _ => None,
-                    },
-                    text: match &c.source {
-                        ClipSource::Text(t) => Some(t.clone()),
-                        _ => None,
-                    },
-                }
-            }
-        }
-
-        let mut preparing = false;
-        let mut draws: Vec<Draw> = Vec::new();
-        let video: Vec<&Track> = self
-            .project
-            .tracks()
-            .iter()
-            .filter(|t| t.kind == TrackKind::Video && !t.hidden)
-            .collect();
-        for track in video.iter().rev() {
-            let Some(c) = track.clip_at(f) else { continue };
-
-            // Inside a crossfade the previous clip keeps running underneath, using material past
-            // its out point, and this clip fades up over it.
-            let mut alpha = c.alpha_at(f);
-            if c.transition_in > 0 && f < c.start + c.transition_in {
-                let t = ((f - c.start) as f32 + 1.0) / c.transition_in as f32;
-                if let Some(prev) = track.prev_clip(c.id) {
-                    draws.push(Draw::from_clip(prev, f, prev.alpha_at(prev.end() - 1)));
-                }
-                alpha *= t.clamp(0.0, 1.0);
-            }
-            draws.push(Draw::from_clip(c, f, alpha));
-        }
-
-        for d in draws {
-            if let Some(mid) = d.media {
-                // During a scrub we take whatever is already decoded rather than stall the frame;
-                // the full-quality frame lands a moment later when the pointer settles.
-                // Holds the last good picture while a span is still being prepared, rather than
-                // dropping to black.
-                let exact = if self.scrubbing || self.playing {
-                    self.cache.peek(mid, d.src).or_else(|| self.cache.get(mid, d.src))
-                } else {
-                    self.cache.get(mid, d.src)
-                };
-                let waiting = exact.is_none();
-                let Some(img) = exact.or_else(|| self.cache.last_good(mid)) else {
-                    preparing = true;
-                    continue;
-                };
-                preparing |= waiting;
-                let key = (mid << 40) ^ ((d.src as u64) << 8) ^ d.color.key();
-                let tex = self.texture_slot(ui.ctx(), layer, &img, &d.color, key);
-                layer += 1;
-
-                let src_aspect = img.width as f32 / img.height.max(1) as f32;
-                let mut dw = frame_rect.width();
-                let mut dh = dw / src_aspect;
-                if dh > frame_rect.height() {
-                    dh = frame_rect.height();
-                    dw = dh * src_aspect;
-                }
-                dw *= d.scale;
-                dh *= d.scale;
-                let center = frame_rect.center()
-                    + Vec2::new(d.px * frame_rect.width(), d.py * frame_rect.height());
-                let dest = Rect::from_center_size(center, Vec2::new(dw, dh));
-                let tint = Color32::from_white_alpha((d.alpha.clamp(0.0, 1.0) * 255.0) as u8);
+        match drawn {
+            Some(id) => {
                 painter.with_clip_rect(frame_rect).image(
-                    tex,
-                    dest,
+                    id,
+                    frame_rect,
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    tint,
+                    Color32::WHITE,
                 );
-            } else if let Some(c) = d.solid {
-                let col = Color32::from_rgba_unmultiplied(
-                    c[0],
-                    c[1],
-                    c[2],
-                    (c[3] as f32 * d.alpha) as u8,
+            }
+            None => {
+                preparing = false;
+                painter.text(
+                    frame_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "The graphics device could not provide a preview.",
+                    theme::ui_font(13.0),
+                    theme::TEXT_DIM,
                 );
-                painter.rect_filled(frame_rect, CornerRadius::ZERO, col);
-            } else if let Some(t) = d.text {
-                let size = (t.size * frame_rect.height()).max(6.0);
-                let pos = frame_rect.min
-                    + Vec2::new(t.x * frame_rect.width(), t.y * frame_rect.height());
-                let anchor = match t.align {
-                    crate::project::TextAlign::Left => Align2::LEFT_CENTER,
-                    crate::project::TextAlign::Center => Align2::CENTER_CENTER,
-                    crate::project::TextAlign::Right => Align2::RIGHT_CENTER,
-                };
-                let col = Color32::from_rgba_unmultiplied(
-                    t.color[0],
-                    t.color[1],
-                    t.color[2],
-                    (t.color[3] as f32 * d.alpha) as u8,
-                );
-                let font = egui::FontId::proportional(size);
-                if t.shadow {
-                    painter.with_clip_rect(frame_rect).text(
-                        pos + Vec2::new(2.0, 2.0),
-                        anchor,
-                        &t.text,
-                        font.clone(),
-                        Color32::from_black_alpha((150.0 * d.alpha) as u8),
-                    );
-                }
-                painter
-                    .with_clip_rect(frame_rect)
-                    .text(pos, anchor, &t.text, font, col);
             }
         }
 
@@ -1849,62 +1828,17 @@ impl App {
             }
         }
     }
+}
 
-    fn texture_slot(
-        &mut self,
-        ctx: &Context,
-        idx: usize,
-        img: &crate::decode::DecodedFrame,
-        adj: &ColorAdjust,
-        key: u64,
-    ) -> egui::TextureId {
-        // Nothing changed since this slot was last filled — skip the colour pass and the upload.
-        if idx < self.tex.len() && self.tex[idx].key == key {
-            return self.tex[idx].handle.id();
-        }
-
-        let pixels: &[u8] = if adj.is_neutral() {
-            &img.rgba
-        } else {
-            apply_color(&img.rgba, &mut self.adjust_buf, adj);
-            &self.adjust_buf
-        };
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [img.width as usize, img.height as usize],
-            pixels,
-        );
-        let opts = egui::TextureOptions::LINEAR;
-        if idx < self.tex.len() {
-            self.tex[idx].handle.set(color, opts);
-            self.tex[idx].key = key;
-        } else {
-            let handle = ctx.load_texture(format!("preview{idx}"), color, opts);
-            self.tex.push(TexSlot { handle, key });
-        }
-        self.tex[idx].handle.id()
+/// Render targets want even dimensions; so does the encoder's chroma subsampling.
+fn even(v: u32) -> u32 {
+    if v < 2 {
+        2
+    } else {
+        v - (v % 2)
     }
 }
 
-/// Applies contrast, brightness and saturation to an RGBA buffer.
-///
-/// Contrast and brightness run through a 256-entry curve on luma and saturation scales the
-/// colour difference from that luma, which is the same decomposition ffmpeg's `eq` filter uses,
-/// so what the preview shows is what the export produces.
-fn apply_color(src: &[u8], dst: &mut Vec<u8>, adj: &ColorAdjust) {
-    dst.clear();
-    dst.reserve(src.len());
-    let lut = adj.luma_lut();
-    let sat = adj.saturation;
-    for px in src.chunks_exact(4) {
-        let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
-        let y = 0.299 * r + 0.587 * g + 0.114 * b;
-        let y2 = lut[(y as usize).min(255)] as f32;
-        dst.push(((y2 + (r - y) * sat).clamp(0.0, 255.0)) as u8);
-        dst.push(((y2 + (g - y) * sat).clamp(0.0, 255.0)) as u8);
-        dst.push(((y2 + (b - y) * sat).clamp(0.0, 255.0)) as u8);
-        dst.push(px[3]);
-    }
-}
 
 /// Box-filters a decoded frame down to at most `max_w` wide for use as a timeline thumbnail.
 fn downsample(img: &crate::decode::DecodedFrame, max_w: u32) -> egui::ColorImage {
@@ -1989,21 +1923,6 @@ fn default_export_path() -> PathBuf {
         .join("kite-export.mp4")
 }
 
-/// A TrueType file for ffmpeg's drawtext. Windows always has these.
-fn export_font() -> Option<PathBuf> {
-    let candidates = [
-        "C:/Windows/Fonts/segoeuib.ttf",
-        "C:/Windows/Fonts/seguisb.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "C:/Windows/Fonts/calibrib.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-    ];
-    candidates.iter().map(PathBuf::from).find(|p| p.is_file())
-}
 
 fn reveal(path: &std::path::Path) {
     #[cfg(windows)]

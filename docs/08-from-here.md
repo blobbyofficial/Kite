@@ -78,16 +78,22 @@ list.
 
 Each phase exists because the next one is unreasonable without it.
 
-### A. One renderer *(unblocks everything)*
+### A. One renderer *(unblocks everything)* — **done**
 
-Build a GPU render graph on `wgpu`: offscreen fp16 targets, a texture pool, and effects expressed
-as shaders. The preview draws from it. **Export renders the same graph frame by frame** and pipes
-raw frames to ffmpeg, which is demoted to demux, decode and encode — the three things it should
-have been doing all along.
+Built. `src/render.rs` holds a GPU render graph on `wgpu`: `Rgba16Float` offscreen targets, a
+texture pool with mip chains, and every effect expressed as a shader. A `FramePlan` describes what
+a timeline frame is made of; the preview renders it on the window's own device and hands egui a
+texture, and the export renders **the same plan** frame by frame and pipes raw pixels to ffmpeg.
+ffmpeg is now demux, decode, audio mixing and encode — it no longer composites anything.
 
-*Exit criteria:* a colour adjustment, a crossfade and a title are implemented **once**, and a test
-renders the same timeline through both paths and compares the pixels within tolerance. Not "both
-succeeded" — the same pixels.
+The colour adjustment, the crossfade, the fades, the picture-in-picture transform and the titles
+are each implemented once. Titles are rasterised with `ab_glyph` from the font egui already
+embeds, so they no longer depend on a system TrueType file being openable.
+
+*Exit criteria, met:* `parity_check` in `src/selftest.rs` renders the same timeline — a colour
+adjustment, a crossfade, a title and a scaled, offset picture-in-picture — through both paths and
+compares the pixels. Matching frames agree to about 4 levels per channel (proxy resampling plus
+the H.264 round trip); unrelated frames differ by 20, and the check fails if that margin closes.
 
 ### B. Real media I/O
 

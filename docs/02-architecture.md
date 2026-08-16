@@ -1,5 +1,11 @@
 # 2. Core Architecture
 
+> **Status.** This document is the intended destination, not a description of what is built.
+> As of phase A there is **one renderer** — a GPU graph in `src/render.rs` with fp16 targets and
+> effects as shaders, shared by the preview and the export. The node graph of §2.2 and the kernel
+> fusion of §2.3 do **not** exist yet; the render graph is the first step towards them, and the
+> 4x fusion claim remains unmeasured. See [08-from-here.md](08-from-here.md).
+
 ## 2.1 Why the incumbents are slow
 
 Design decisions are only defensible against the alternative. Every choice below is a response

@@ -7,11 +7,10 @@
 use crate::decode::FrameCache;
 use crate::export::{self, Encoder, ExportMsg, ExportSettings, Quality};
 use crate::ffmpeg::{self, Tools};
-use crate::framestore::FrameStore;
 use crate::import::{ImportMsg, Importer};
 use crate::project::{ClipSource, ImportState, MediaItem, Project, TextProps, TrackKind};
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -245,29 +244,22 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
         fps: project.seq().fps,
         include_audio: true,
     };
-    let font = find_font();
-    if font.is_none() {
-        println!("  --  no TrueType font found, titles will be skipped in this run");
-    }
-    let assets = export::Assets::prepare(font.as_deref())?;
-    verify_titles_render(&tools, &assets)?;
-    let (inputs, graph, has_audio) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
+    let (inputs, graph, has_audio) = export::build_audio_graph(&project, project.tl(), &settings, 1);
     if inputs.len() != 1 {
-        bail!("expected one input file, got {}", inputs.len());
+        bail!("expected one audio input file, got {}", inputs.len());
     }
     if !has_audio {
         bail!("export graph produced no audio");
     }
     step!(
-        "filtergraph is {} chars over {} input(s), passed as {:?}",
+        "audio filtergraph is {} chars over {} input(s), passed as {:?}",
         graph.len(),
         inputs.len(),
         export::graph_arg(&tools)
     );
 
-    assets.cleanup();
     let t0 = Instant::now();
-    let job = export::start(tools.clone(), project.clone(), project.tl().id, settings, font.clone());
+    let job = export::start(tools.clone(), project.clone(), project.tl().id, settings.clone());
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         if Instant::now() > deadline {
@@ -309,6 +301,12 @@ pub fn run(tools: Arc<Tools>) -> Result<()> {
     // ---- 7b. speed changes --------------------------------------------------
     speed_check(&tools, &dir, &src, info.duration)?;
 
+    // ---- 7c. one renderer: the preview and the export must agree ----------
+    parity_check(&tools, &dir, &src, info.duration, media_id, &cache)?;
+
+    // ---- 7d. the interactive path has to stay inside its budget -----------
+    preview_budget_check(&cache, media_id, &src, info.duration)?;
+
     // ---- 8. a graph big enough to have overflowed a command line ----------
     big_graph_check(&tools, &dir, &src, info.duration)?;
 
@@ -333,13 +331,16 @@ pub fn export_cli(tools: Arc<Tools>, project_path: &str, out: &str) -> Result<()
         fps: project.seq().fps,
         include_audio: true,
     };
-    let font = find_font();
-    let assets = export::Assets::prepare(font.as_deref())?;
-    let (inputs, graph, has_audio) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
-    assets.cleanup();
-    println!("inputs: {inputs:#?}");
+    let (inputs, graph, has_audio) = export::build_audio_graph(&project, project.tl(), &settings, 1);
+    println!("audio inputs: {inputs:#?}");
     println!("has_audio: {has_audio}");
-    println!("--- filtergraph ---\n{graph}\n---");
+    println!("--- audio filtergraph ---\n{graph}\n---");
+    println!(
+        "--- video ---\n{} frames composited on the GPU at {}x{}\n---",
+        project.tl().duration(),
+        settings.width,
+        settings.height
+    );
 
     run_export_blocking(&tools, project, settings)?;
     let probed = ffmpeg::probe(&tools, std::path::Path::new(out))?;
@@ -616,7 +617,7 @@ fn run_export_blocking(
     settings: ExportSettings,
 ) -> Result<()> {
     let tl = project.tl().id;
-    let job = export::start(tools.clone(), project, tl, settings, None);
+    let job = export::start(tools.clone(), project, tl, settings);
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         if Instant::now() > deadline {
@@ -662,13 +663,8 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         fps: 30,
             include_audio: true,
     };
-    let assets = export::Assets::prepare(None)?;
-    let (_, graph, _) = export::build_graph(&project, project.tl(), &settings, Some(&assets))?;
-    assets.cleanup();
+    let (_, graph, _) = export::build_audio_graph(&project, project.tl(), &settings, 1);
     let len = graph.len();
-    if len < 32_768 {
-        println!("  --  graph is {len} chars, smaller than expected but still exercised");
-    }
 
     run_export_blocking(tools, project, settings)?;
     let probed = ffmpeg::probe(tools, &out)?;
@@ -677,7 +673,7 @@ fn big_graph_check(tools: &Arc<Tools>, dir: &std::path::Path, src: &std::path::P
         bail!("large export is {:.2}s, expected {expected:.2}s", probed.duration);
     }
     std::fs::remove_file(&out).ok();
-    pass!("{CUTS}-cut timeline exported, filtergraph {len} chars");
+    pass!("{CUTS}-cut timeline rendered, audio filtergraph {len} chars");
     Ok(())
 }
 
@@ -737,58 +733,266 @@ fn scale_check() -> Result<()> {
     Ok(())
 }
 
-/// Renders white text on black and counts the bright pixels.
-///
-/// ffmpeg builds with fontconfig quietly substitute a fallback font when `fontfile` cannot be
-/// opened, so "the export succeeded" is not evidence that titles work. This checks that pixels
-/// actually changed.
-fn verify_titles_render(tools: &Tools, assets: &export::Assets) -> Result<()> {
-    let Some(font) = assets.font_file.as_deref() else {
-        println!("  --  skipping the title check, no font available");
-        return Ok(());
-    };
-    std::fs::write(assets.dir.join("probe.txt"), b"HELLO")?;
+/// A timeline that exercises everything phase A had to unify: a colour adjustment, a crossfade,
+/// a title and a scaled, offset picture-in-picture.
+fn parity_project(media_id: u64, src: &std::path::Path, dur: f64) -> Result<Project> {
+    let mut project = Project::default();
+    project.media.push(media_item(media_id, src, dur));
+    // Three video tracks: the cut, the picture-in-picture, and the title above both.
+    project.add_track(TrackKind::Video);
 
+    let video: Vec<u64> = project
+        .tracks()
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video)
+        .map(|t| t.id)
+        .collect();
+    let (top, mid, base) = (video[0], video[1], *video.last().context("no video track")?);
+
+    let mut a = project.new_clip(ClipSource::Media(media_id), 0, 40, 0);
+    a.color = crate::project::ColorAdjust { brightness: 0.06, contrast: 1.3, saturation: 0.55 };
+    let mut b = project.new_clip(ClipSource::Media(media_id), 40, 40, 55);
+    b.transition_in = 15;
+
+    let mut pip = project.new_clip(ClipSource::Media(media_id), 10, 60, 20);
+    pip.scale = 0.35;
+    pip.pos_x = 0.28;
+    pip.pos_y = -0.25;
+    pip.opacity = 0.9;
+
+    let title = project.new_clip(
+        ClipSource::Text(TextProps {
+            text: "Kite".into(),
+            size: 0.22,
+            ..Default::default()
+        }),
+        5,
+        70,
+        0,
+    );
+
+    project.track_mut(base).context("no base track")?.clips.push(a);
+    project.track_mut(base).context("no base track")?.clips.push(b);
+    project.track_mut(mid).context("no middle track")?.clips.push(pip);
+    project.track_mut(top).context("no top track")?.clips.push(title);
+    project.normalize();
+    Ok(project)
+}
+
+/// Serves the render graph from the proxy cache, waiting for spans the way the preview does not
+/// have to — a test can afford to block where the interface cannot.
+struct ProxyFrames<'a> {
+    cache: &'a FrameCache,
+    missed: u32,
+}
+
+impl crate::render::FrameSource for ProxyFrames<'_> {
+    fn frame(
+        &mut self,
+        _clip: u64,
+        media: u64,
+        src_frame: i64,
+    ) -> Option<Arc<crate::decode::DecodedFrame>> {
+        let f = src_frame.max(0) as u32;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if let Some(v) = self.cache.get(media, f) {
+                return Some(v);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.missed += 1;
+        None
+    }
+}
+
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 255.0;
+    }
+    let mut total = 0f64;
+    // Alpha is opaque in both by construction; comparing it would only dilute the number.
+    for i in 0..n {
+        if i % 4 == 3 {
+            continue;
+        }
+        total += (a[i] as f64 - b[i] as f64).abs();
+    }
+    total / (n as f64 * 0.75)
+}
+
+/// Pulls one exact frame out of a rendered file as RGBA.
+fn exported_frame(tools: &Tools, file: &std::path::Path, n: i64, w: u32, h: u32) -> Result<Vec<u8>> {
     let out = ffmpeg::command(&tools.ffmpeg)
-        .current_dir(&assets.dir)
-        .args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:d=1"])
-        .args([
-            "-filter_complex",
-            &format!(
-                "[0:v]drawtext=fontfile={font}:textfile=probe.txt:expansion=none\
-                 :fontsize=120:fontcolor=white:x=20:y=100[o]"
-            ),
-        ])
-        .args(["-map", "[o]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .args(["-v", "error", "-i"])
+        .arg(file)
+        .args(["-vf", &format!("select=eq(n\\,{n})"), "-vsync", "0", "-frames:v", "1"])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .context("running the title render check")?;
+        .context("reading a frame back out of the render")?;
+    let want = (w * h * 4) as usize;
+    if out.stdout.len() < want {
+        bail!("frame {n} came back as {} bytes, expected {want}", out.stdout.len());
+    }
+    Ok(out.stdout[..want].to_vec())
+}
 
-    if !out.status.success() {
+/// **The exit criterion for phase A.**
+///
+/// The same timeline goes through both paths. The preview path plans the frame and renders it on
+/// the GPU from proxy pictures; the export path plans the same frame, renders it on the GPU from
+/// full-resolution decoders, and encodes it. Then the pixels are compared.
+///
+/// "Both finished" would prove nothing, so the tolerance is justified rather than picked: every
+/// pair is also compared against a *different* frame of the same render, and the agreement has to
+/// be far closer than that. If compositing ever drifts between the two paths, that margin closes.
+fn parity_check(
+    tools: &Arc<Tools>,
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    dur: f64,
+    media_id: u64,
+    cache: &Arc<FrameCache>,
+) -> Result<()> {
+    const W: u32 = 640;
+    const H: u32 = 360;
+    let project = parity_project(media_id, src, dur)?;
+    if project.duration() != 80 {
+        bail!("the parity timeline is {} frames, expected 80", project.duration());
+    }
+
+    let out = dir.join("parity.mp4");
+    let settings = ExportSettings {
+        path: out.clone(),
+        encoder: Encoder::X264,
+        quality: Quality::High,
+        width: W,
+        height: H,
+        fps: 30,
+        include_audio: false,
+    };
+    run_export_blocking(tools, project.clone(), settings)?;
+
+    let gpu = crate::render::Gpu::headless().context("no GPU for the preview side of the check")?;
+    let mut renderer = crate::render::Renderer::new(gpu)?;
+    let mut source = ProxyFrames { cache, missed: 0 };
+
+    // One frame per feature: the grade alone, the grade under a title and a picture-in-picture,
+    // and the middle of the dissolve.
+    let frames = [(3i64, "colour adjustment"), (25, "title and picture-in-picture"), (47, "crossfade")];
+    let mut previews = Vec::new();
+    let mut exports = Vec::new();
+    let mut worst = 0f64;
+
+    for (n, what) in frames {
+        let plan = crate::render::plan_frame(project.tl(), n, W, H);
+        renderer.render(&plan, &mut source)?;
+        let preview = renderer.read_rgba()?;
+        let exported = exported_frame(tools, &out, n, W, H)?;
+        let d = mean_abs_diff(&preview, &exported);
+        if d > 12.0 {
+            bail!(
+                "frame {n} ({what}) differs between the preview and the export by {d:.2} per \
+                 channel — the two paths are not rendering the same picture"
+            );
+        }
+        worst = worst.max(d);
+        previews.push(preview);
+        exports.push(exported);
+    }
+
+    if source.missed > 0 {
+        bail!("{} proxy frames never became available", source.missed);
+    }
+
+    // The control. If the tolerance above were simply loose, this would pass too.
+    let control = mean_abs_diff(&previews[0], &exports[1]);
+    if control < worst * 3.0 {
         bail!(
-            "titles do not render: {}",
-            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown")
+            "the check cannot tell frames apart: matching frames differ by {worst:.2} and \
+             different ones by only {control:.2}"
         );
     }
-    let bright = out.stdout.iter().filter(|b| **b > 200).count();
-    if bright < 500 {
-        bail!("the title font drew only {bright} bright pixels — text is not being rendered");
+
+    // Each feature has to be visibly present in both renders, not merely equally absent.
+    let (pw, ew) = (&previews[1], &exports[1]);
+    for (name, px) in [("preview", pw), ("export", ew)] {
+        let bright = px.chunks_exact(4).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count();
+        if bright < 300 {
+            bail!("the title drew only {bright} bright pixels in the {name} render");
+        }
     }
-    pass!("titles render ({bright} pixels drawn)");
+    // The picture-in-picture sits up and to the right of centre; that corner must differ from
+    // the same spot on a frame where the picture-in-picture is not there.
+    let corner = |px: &[u8]| {
+        let (x, y) = ((W as f64 * 0.75) as usize, (H as f64 * 0.25) as usize);
+        let i = (y * W as usize + x) * 4;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+    let with_pip = corner(&previews[1]);
+    let without = corner(&previews[0]);
+    if with_pip == without {
+        bail!("the picture-in-picture did not change the frame where it should be");
+    }
+
+    std::fs::remove_file(&out).ok();
+    pass!(
+        "preview and export render the same pixels (worst {worst:.2} per channel, \
+         unrelated frames {control:.1})"
+    );
     Ok(())
 }
 
-fn find_font() -> Option<PathBuf> {
-    [
-        "C:/Windows/Fonts/segoeuib.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
+/// The interactive path has a 16 ms budget. This measures a full-resolution preview frame.
+///
+/// A CI runner with no graphics card falls back to a software rasteriser, where 16 ms is not a
+/// meaningful target — so that case is measured and reported rather than failed on, and the gate
+/// only bites where there is real hardware to gate.
+fn preview_budget_check(
+    cache: &Arc<FrameCache>,
+    media_id: u64,
+    src: &std::path::Path,
+    dur: f64,
+) -> Result<()> {
+    let project = parity_project(media_id, src, dur)?;
+    let gpu = crate::render::Gpu::headless()?;
+    let software = {
+        let a = gpu.adapter.to_lowercase();
+        a.contains("llvmpipe") || a.contains("software") || a.contains("swiftshader") || a.contains("lavapipe")
+    };
+    let mut renderer = crate::render::Renderer::new(gpu)?;
+    let mut source = ProxyFrames { cache, missed: 0 };
+
+    // Warm the caches first; the budget is about steady-state playback, not the first frame.
+    for n in [20i64, 21, 22] {
+        let plan = crate::render::plan_frame(project.tl(), n, 1920, 1080);
+        renderer.render(&plan, &mut source)?;
+    }
+    let t0 = Instant::now();
+    const N: i64 = 20;
+    for i in 0..N {
+        let plan = crate::render::plan_frame(project.tl(), 20 + i, 1920, 1080);
+        renderer.render(&plan, &mut source)?;
+    }
+    // Nothing is read back on the preview path, so wait for the queue rather than time a
+    // submission that has not run yet.
+    renderer.read_rgba()?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / N as f64;
+
+    if software {
+        println!(
+            "  --  preview frame {ms:.2} ms at 1920x1080 on a software rasteriser ({}); \
+             the 16 ms gate needs real hardware",
+            renderer.adapter()
+        );
+    } else if ms > 16.0 {
+        bail!("a 1920x1080 preview frame took {ms:.2} ms, over the 16 ms interactive budget");
+    } else {
+        pass!("preview frame {ms:.2} ms at 1920x1080 on {}", renderer.adapter());
+    }
+    Ok(())
 }
+

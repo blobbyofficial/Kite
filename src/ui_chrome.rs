@@ -1,7 +1,6 @@
 //! Menus, media pool, inspector, transport and dialogs.
 
 use crate::app::{App, PROXY_HEIGHTS};
-use crate::export::Quality;
 use crate::project::{timecode, ClipSource, ImportState, MediaId, RenderStatus, TextAlign, TrackKind};
 use crate::project::ColorAdjust;
 use crate::theme;

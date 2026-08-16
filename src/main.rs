@@ -10,6 +10,7 @@ mod framestore;
 mod import;
 mod project;
 mod proxy;
+mod render;
 mod selftest;
 mod theme;
 mod timeline;

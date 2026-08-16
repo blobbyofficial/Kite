@@ -1,14 +1,20 @@
-//! Export: turns the timeline into a single ffmpeg filtergraph over the **original** media.
+//! Export: renders the timeline through the GPU graph, frame by frame, and hands raw pixels to
+//! ffmpeg to encode.
 //!
-//! Playback uses proxies, but delivery never does — the graph below reads the source files at full
-//! resolution, so what you export is the real quality regardless of what you edited against.
+//! Playback uses proxies, but delivery never does — the decoders below read the source files at
+//! full resolution, so what you export is the real quality regardless of what you edited against.
+//!
+//! Compositing is **not** here. It is in `render.rs`, shared with the preview, which is the whole
+//! point of the arrangement: ffmpeg does demux, decode and encode, and nothing else.
 
+use crate::decode::DecodedFrame;
 use crate::ffmpeg::{self, Tools};
-use crate::project::{ClipSource, MediaId, Project, TextAlign, Timeline, TrackKind};
-use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use crate::project::{ClipId, MediaId, Project, Timeline};
+use crate::render::{plan_frame, FrameSource, Gpu, Renderer};
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -213,72 +219,9 @@ fn detect_graph_arg(tools: &Tools) -> GraphArg {
     found
 }
 
-/// Files the filtergraph needs to reference by name.
-///
-/// Quoting a Windows path inside an ffmpeg filtergraph is a well-known source of breakage: the
-/// drive-letter colon is an option separator, and getting the escaping subtly wrong makes ffmpeg
-/// either fail outright or quietly substitute a fallback font. Instead we stage the font and the
-/// title text in one directory, run ffmpeg with that as its working directory, and refer to them
-/// by bare filename. There is then nothing to escape.
-pub struct Assets {
-    pub dir: PathBuf,
-    pub font_file: Option<String>,
-    counter: std::cell::Cell<usize>,
-}
-
-impl Assets {
-    pub fn prepare(font: Option<&Path>) -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "kite-render-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).context("creating the render staging directory")?;
-        let font_file = match font {
-            Some(src) => {
-                let ext = src
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_lowercase())
-                    .unwrap_or_else(|| "ttf".into());
-                let name = format!("font.{ext}");
-                std::fs::copy(src, dir.join(&name))
-                    .with_context(|| format!("copying the title font from {}", src.display()))?;
-                Some(name)
-            }
-            None => None,
-        };
-        Ok(Self { dir, font_file, counter: std::cell::Cell::new(0) })
-    }
-
-    /// Writes title text to its own file so the text itself never needs escaping either —
-    /// quotes, colons, percent signs, newlines and emoji all pass through untouched.
-    fn write_text(&self, text: &str) -> Result<String> {
-        let n = self.counter.get();
-        self.counter.set(n + 1);
-        let name = format!("text{n}.txt");
-        std::fs::write(self.dir.join(&name), text.as_bytes())
-            .context("writing title text for the renderer")?;
-        Ok(name)
-    }
-
-    pub fn cleanup(&self) {
-        std::fs::remove_dir_all(&self.dir).ok();
-    }
-}
 
 fn f(t: f64) -> String {
     format!("{t:.6}")
-}
-
-fn even(v: i64) -> i64 {
-    if v < 2 {
-        2
-    } else {
-        v - (v % 2)
-    }
 }
 
 struct Graph {
@@ -302,223 +245,40 @@ impl Graph {
     }
 }
 
-/// Builds the complete `-filter_complex` string plus the ordered list of input files.
-pub fn build_graph(
+/// Builds the audio side of the render: the ordered list of source files to open and the
+/// filtergraph that trims, retimes, fades and mixes them.
+///
+/// Video is not in here any more. The picture is composited on the GPU and arrives at ffmpeg as
+/// raw frames on stdin, which is always input 0 — hence `first_input`, the index the first audio
+/// file gets on the command line.
+pub fn build_audio_graph(
     project: &Project,
     tl: &Timeline,
     settings: &ExportSettings,
-    assets: Option<&Assets>,
-) -> Result<(Vec<PathBuf>, String, bool)> {
-    let w = settings.width as i64;
-    let h = settings.height as i64;
+    first_input: usize,
+) -> (Vec<PathBuf>, String, bool) {
     let fps = settings.fps.max(1);
-    let total_frames = tl.duration();
-    if total_frames <= 0 {
-        bail!("the timeline is empty — add a clip before exporting");
-    }
-    let dur = total_frames as f64 / fps as f64;
-
-    // One ffmpeg input per distinct source file, reused by every clip that references it.
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut index_of: BTreeMap<MediaId, usize> = BTreeMap::new();
-    for track in project.tracks() {
-        for clip in &track.clips {
-            if let Some(mid) = clip.media_id() {
-                if !index_of.contains_key(&mid) {
-                    let Some(m) = project.media(mid) else { continue };
-                    index_of.insert(mid, inputs.len());
-                    inputs.push(m.path.clone());
+    if settings.include_audio {
+        for track in tl.tracks.iter().filter(|t| !t.muted) {
+            for clip in &track.clips {
+                let Some(mid) = clip.media_id() else { continue };
+                let Some(m) = project.media(mid) else { continue };
+                if !m.has_audio || index_of.contains_key(&mid) {
+                    continue;
                 }
+                index_of.insert(mid, first_input + inputs.len());
+                inputs.push(m.path.clone());
             }
         }
     }
 
     let mut g = Graph::new();
-    g.push(format!(
-        "color=c=black:s={w}x{h}:r={fps}:d={}[bg]",
-        f(dur)
-    ));
-    let mut current = "bg".to_string();
-
-    // Video tracks composite bottom-up, so walk them in reverse (they are stored top-first).
-    let video_tracks: Vec<_> = tl
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Video && !t.hidden)
-        .collect();
-
-    for track in video_tracks.iter().rev() {
-        for (i, clip) in track.clips.iter().enumerate() {
-            // If the next clip dissolves in, this one keeps rolling underneath for that long.
-            let tail = track
-                .clips
-                .get(i + 1)
-                .map(|n| n.transition_in.max(0))
-                .unwrap_or(0);
-            let t0 = clip.start as f64 / fps as f64;
-            let t1 = (clip.end() + tail) as f64 / fps as f64;
-            let fade_in = clip.fade_in as f64 / fps as f64;
-            let fade_out = clip.fade_out as f64 / fps as f64;
-            let dissolve_in = clip.transition_in.max(0) as f64 / fps as f64;
-            let dissolve_out = tail as f64 / fps as f64;
-
-            match &clip.source {
-                ClipSource::Media(mid) => {
-                    let Some(m) = project.media(*mid) else { continue };
-                    if !m.has_video {
-                        continue;
-                    }
-                    let Some(&idx) = index_of.get(mid) else { continue };
-                    let speed = clip.speed.max(0.01) as f64;
-                    let src_in = clip.src_in as f64 / fps as f64;
-                    let src_out = src_in + ((clip.len + tail) as f64 * speed / fps as f64);
-
-                    let (cw, ch) = fitted_size(m.src_width, m.src_height, w, h, clip.scale);
-                    let lbl = g.label("v");
-                    let mut chain = format!("[{idx}:v]trim=start={}:end={}", f(src_in), f(src_out));
-                    // setpts both retimes for speed and slides the clip to its place on the line.
-                    if (speed - 1.0).abs() > 1e-6 {
-                        chain.push_str(&format!(",setpts=(PTS-STARTPTS)/{}+{}/TB", f(speed), f(t0)));
-                    } else {
-                        chain.push_str(&format!(",setpts=PTS-STARTPTS+{}/TB", f(t0)));
-                    }
-                    if !clip.color.is_neutral() {
-                        chain.push_str(&format!(
-                            ",eq=contrast={:.4}:brightness={:.4}:saturation={:.4}",
-                            clip.color.contrast, clip.color.brightness, clip.color.saturation
-                        ));
-                    }
-                    chain.push_str(&format!(
-                        ",scale={cw}:{ch}:flags=bicubic,fps={fps},format=rgba"
-                    ));
-                    if clip.opacity < 0.999 {
-                        chain.push_str(&format!(",colorchannelmixer=aa={:.4}", clip.opacity));
-                    }
-                    if fade_in > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=in:st={}:d={}:alpha=1",
-                            f(t0),
-                            f(fade_in)
-                        ));
-                    }
-                    if fade_out > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=out:st={}:d={}:alpha=1",
-                            f(t1 - dissolve_out - fade_out),
-                            f(fade_out)
-                        ));
-                    }
-                    // The dissolve itself: this clip fades away while the next fades up over it.
-                    if dissolve_in > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=in:st={}:d={}:alpha=1",
-                            f(t0),
-                            f(dissolve_in)
-                        ));
-                    }
-                    if dissolve_out > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=out:st={}:d={}:alpha=1",
-                            f(t1 - dissolve_out),
-                            f(dissolve_out)
-                        ));
-                    }
-                    chain.push_str(&format!("[{lbl}]"));
-                    g.push(chain);
-
-                    let (x, y) = position(w, h, cw, ch, clip.pos_x, clip.pos_y);
-                    let out = g.label("c");
-                    g.push(format!(
-                        "[{current}][{lbl}]overlay=x={x}:y={y}:eof_action=pass:\
-                         enable='between(t,{},{})'[{out}]",
-                        f(t0),
-                        f(t1)
-                    ));
-                    current = out;
-                }
-                ClipSource::Color(rgba) => {
-                    let lbl = g.label("v");
-                    let mut chain = format!(
-                        "color=c=0x{:02x}{:02x}{:02x}@{:.3}:s={w}x{h}:r={fps}:d={},format=rgba,\
-                         setpts=PTS-STARTPTS+{}/TB",
-                        rgba[0],
-                        rgba[1],
-                        rgba[2],
-                        rgba[3] as f32 / 255.0,
-                        f(t1 - t0),
-                        f(t0)
-                    );
-                    if dissolve_in > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=in:st={}:d={}:alpha=1",
-                            f(t0),
-                            f(dissolve_in)
-                        ));
-                    }
-                    if dissolve_out > 0.0 {
-                        chain.push_str(&format!(
-                            ",fade=t=out:st={}:d={}:alpha=1",
-                            f(t1 - dissolve_out),
-                            f(dissolve_out)
-                        ));
-                    }
-                    chain.push_str(&format!("[{lbl}]"));
-                    g.push(chain);
-                    let out = g.label("c");
-                    g.push(format!(
-                        "[{current}][{lbl}]overlay=x=0:y=0:eof_action=pass:\
-                         enable='between(t,{},{})'[{out}]",
-                        f(t0),
-                        f(t1)
-                    ));
-                    current = out;
-                }
-                ClipSource::Text(tp) => {
-                    // Without a usable font we skip titles rather than emit a graph that fails.
-                    let Some(assets) = assets else { continue };
-                    let Some(fontname) = assets.font_file.as_deref() else { continue };
-                    let textfile = assets.write_text(&tp.text)?;
-                    let size = (tp.size * h as f32).round().max(8.0) as i64;
-                    let x_expr = match tp.align {
-                        TextAlign::Left => format!("{}", (tp.x * w as f32).round() as i64),
-                        TextAlign::Center => {
-                            format!("{}-text_w/2", (tp.x * w as f32).round() as i64)
-                        }
-                        TextAlign::Right => {
-                            format!("{}-text_w", (tp.x * w as f32).round() as i64)
-                        }
-                    };
-                    let y = (tp.y * h as f32).round() as i64 - size / 2;
-                    let out = g.label("c");
-                    let mut d = format!(
-                        "[{current}]drawtext=fontfile={fontname}:textfile={textfile}\
-                         :expansion=none:fontsize={size}\
-                         :fontcolor=0x{:02x}{:02x}{:02x}@{:.3}:x={x_expr}:y={y}",
-                        tp.color[0],
-                        tp.color[1],
-                        tp.color[2],
-                        tp.color[3] as f32 / 255.0,
-                    );
-                    if tp.shadow {
-                        d.push_str(":shadowcolor=black@0.6:shadowx=2:shadowy=2");
-                    }
-                    if tp.box_bg {
-                        d.push_str(":box=1:boxcolor=black@0.5:boxborderw=12");
-                    }
-                    d.push_str(&format!(":enable='between(t,{},{})'[{out}]", f(t0), f(t1)));
-                    g.push(d);
-                    current = out;
-                }
-            }
-        }
-    }
-
-    g.push(format!("[{current}]format=yuv420p[vout]"));
-
-    // --- audio ---
     let mut alabels: Vec<String> = Vec::new();
     for track in tl.tracks.iter().filter(|t| !t.muted && settings.include_audio) {
         for (i, clip) in track.clips.iter().enumerate() {
+            // If the next clip dissolves in, this one keeps rolling underneath for that long.
             let tail = track
                 .clips
                 .get(i + 1)
@@ -529,7 +289,6 @@ pub fn build_graph(
             if !m.has_audio {
                 continue;
             }
-            // A muted video track still contributes its audio unless the track itself is muted.
             let Some(&idx) = index_of.get(&mid) else { continue };
             let speed = clip.speed.max(0.01) as f64;
             let t0 = clip.start as f64 / fps as f64;
@@ -590,8 +349,7 @@ pub fn build_graph(
             alabels.len()
         ));
     }
-
-    Ok((inputs, g.join(), has_audio))
+    (inputs, g.join(), has_audio)
 }
 
 /// ffmpeg's `atempo` only accepts 0.5–2.0 per instance, so larger speed changes are chained.
@@ -613,25 +371,146 @@ fn atempo_chain(speed: f64) -> Vec<f64> {
     out
 }
 
-fn fitted_size(sw: u32, sh: u32, w: i64, h: i64, scale: f32) -> (i64, i64) {
-    let sw = sw.max(1) as f64;
-    let sh = sh.max(1) as f64;
-    let fit = (w as f64 / sw).min(h as f64 / sh) * scale.max(0.01) as f64;
-    (even((sw * fit).round() as i64), even((sh * fit).round() as i64))
+// ---------------------------------------------------------------------------
+// Full-resolution pictures for the render graph
+// ---------------------------------------------------------------------------
+
+/// How far ahead it is worth decoding-and-discarding before it becomes cheaper to seek again.
+const SKIP_LIMIT: i64 = 240;
+
+/// One ffmpeg process per clip, decoding the original file at full resolution.
+///
+/// A render walks the timeline forwards, so each clip's source is read forwards too and one
+/// sequential decoder per clip is all it takes. Two clips over the same file — a dissolve, or a
+/// picture-in-picture of the same shot — get one decoder each, which is why the frame source is
+/// keyed on the clip and not on the media.
+struct ClipDec {
+    child: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+    w: u32,
+    h: u32,
+    /// Source frame index, at project rate, that the pipe will yield next.
+    next: i64,
+    last: Option<Arc<DecodedFrame>>,
+    eof: bool,
 }
 
-fn position(w: i64, h: i64, cw: i64, ch: i64, px: f32, py: f32) -> (i64, i64) {
-    let x = (w - cw) / 2 + (px * w as f32).round() as i64;
-    let y = (h - ch) / 2 + (py * h as f32).round() as i64;
-    (x, y)
+impl Drop for ClipDec {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
+
+impl ClipDec {
+    fn open(ffmpeg: &std::path::Path, path: &std::path::Path, w: u32, h: u32, fps: u32, from: i64) -> Result<Self> {
+        let mut cmd = ffmpeg::command(ffmpeg);
+        cmd.args(["-hide_banner", "-v", "error", "-nostdin"]);
+        if from > 0 {
+            // Input-side seeking, which ffmpeg makes accurate by decoding forward from the
+            // preceding keyframe. Output frame 0 is then the frame we asked for.
+            cmd.args(["-ss", &format!("{:.6}", from as f64 / fps.max(1) as f64)]);
+        }
+        cmd.arg("-i").arg(path);
+        // Resample to the project rate so a source frame index is a timeline frame index.
+        cmd.args(["-an", "-sn", "-vf", &format!("fps={fps},format=rgba")]);
+        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("starting a decoder for {}", path.display()))?;
+        let out = std::io::BufReader::with_capacity(
+            1 << 20,
+            child.stdout.take().context("decoder produced no pipe")?,
+        );
+        Ok(Self { child, out, w, h, next: from, last: None, eof: false })
+    }
+
+    fn read_one(&mut self) -> Option<Arc<DecodedFrame>> {
+        if self.eof {
+            return None;
+        }
+        let mut buf = vec![0u8; (self.w as usize) * (self.h as usize) * 4];
+        if self.out.read_exact(&mut buf).is_err() {
+            self.eof = true;
+            return None;
+        }
+        self.next += 1;
+        let frame = Arc::new(DecodedFrame { width: self.w, height: self.h, rgba: buf });
+        self.last = Some(frame.clone());
+        Some(frame)
+    }
+}
+
+/// The export's answer to "give me this clip's picture at this source frame".
+pub struct ExportFrames {
+    ffmpeg: PathBuf,
+    fps: u32,
+    /// path, width, height for every media item the timeline uses.
+    media: BTreeMap<MediaId, (PathBuf, u32, u32)>,
+    decoders: HashMap<ClipId, ClipDec>,
+}
+
+impl ExportFrames {
+    pub fn new(tools: &Tools, project: &Project, fps: u32) -> Self {
+        let mut media = BTreeMap::new();
+        for m in &project.media {
+            if m.has_video {
+                media.insert(m.id, (m.path.clone(), m.src_width.max(1), m.src_height.max(1)));
+            }
+        }
+        Self { ffmpeg: tools.ffmpeg.clone(), fps, media, decoders: HashMap::new() }
+    }
+
+    /// Clips that are behind us will never be asked for again; letting their decoders go keeps a
+    /// long timeline from accumulating one ffmpeg process per cut.
+    pub fn retain(&mut self, live: &[ClipId]) {
+        self.decoders.retain(|k, _| live.contains(k));
+    }
+}
+
+impl FrameSource for ExportFrames {
+    fn frame(&mut self, clip: ClipId, media: MediaId, src_frame: i64) -> Option<Arc<DecodedFrame>> {
+        let (path, w, h) = self.media.get(&media)?.clone();
+        let src_frame = src_frame.max(0);
+        let need_restart = match self.decoders.get(&clip) {
+            None => true,
+            // Behind the pipe, or so far ahead that seeking beats discarding.
+            Some(d) => src_frame + 1 < d.next || src_frame > d.next + SKIP_LIMIT,
+        };
+        if need_restart {
+            match ClipDec::open(&self.ffmpeg, &path, w, h, self.fps, src_frame) {
+                Ok(d) => {
+                    self.decoders.insert(clip, d);
+                }
+                Err(_) => return None,
+            }
+        }
+        let d = self.decoders.get_mut(&clip)?;
+        if src_frame + 1 == d.next {
+            // Already sitting on it — a slowed-down clip asks for the same frame repeatedly.
+            return d.last.clone();
+        }
+        while d.next <= src_frame {
+            if d.read_one().is_none() {
+                // Past the end of the source: hold the last frame rather than punch a hole.
+                return d.last.clone();
+            }
+        }
+        d.last.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running a render
+// ---------------------------------------------------------------------------
 
 pub fn start(
     tools: Arc<Tools>,
     project: Project,
     timeline: crate::project::TimelineId,
     settings: ExportSettings,
-    font: Option<PathBuf>,
 ) -> ExportJob {
     let (tx, rx) = crossbeam_channel::unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -645,16 +524,7 @@ pub fn start(
                 let _ = tx.send(ExportMsg::Failed("that timeline no longer exists".into()));
                 return;
             };
-            let total_frames = tl.duration();
-            let assets = match Assets::prepare(font.as_deref()) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx.send(ExportMsg::Failed(format!("{e:#}")));
-                    return;
-                }
-            };
-            let res = run_export(&tools, &project, &tl, &s2, &assets, total_frames, &tx, &c2);
-            assets.cleanup();
+            let res = run_export(&tools, &project, &tl, &s2, &tx, &c2);
             match res {
                 Ok(()) => {
                     if c2.load(Ordering::Relaxed) {
@@ -681,43 +551,81 @@ pub fn start(
     ExportJob { rx, cancel, settings }
 }
 
+fn even(v: u32) -> u32 {
+    if v < 2 {
+        2
+    } else {
+        v - (v % 2)
+    }
+}
+
+/// Which clips contribute to a frame, so decoders for clips already behind us can be closed.
+fn live_clips(plan: &crate::render::FramePlan) -> Vec<ClipId> {
+    plan.layers
+        .iter()
+        .filter_map(|l| match &l.source {
+            crate::render::LayerSource::Media { clip, .. } => Some(*clip),
+            _ => None,
+        })
+        .collect()
+}
+
 fn run_export(
     tools: &Tools,
     project: &Project,
     tl: &Timeline,
     settings: &ExportSettings,
-    assets: &Assets,
-    total_frames: i64,
     tx: &crossbeam_channel::Sender<ExportMsg>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let (inputs, graph, has_audio) = build_graph(project, tl, settings, Some(assets))?;
+    let total_frames = tl.duration();
+    if total_frames <= 0 {
+        bail!("the timeline is empty — add a clip before exporting");
+    }
+    let w = even(settings.width);
+    let h = even(settings.height);
+    let fps = settings.fps.max(1);
+
+    let mut renderer = Renderer::new(Gpu::headless()?)
+        .context("preparing the render graph")?;
+    let mut frames = ExportFrames::new(tools, project, fps);
+
+    let (audio_inputs, audio_graph, has_audio) = build_audio_graph(project, tl, settings, 1);
+
+    // The audio graph and any staging it needs live in their own directory, which is also
+    // ffmpeg's working directory, so nothing on the command line has to be escaped.
+    let staging = std::env::temp_dir().join(format!("kite-render-{}", std::process::id()));
+    std::fs::create_dir_all(&staging).context("creating the render staging directory")?;
+    let out_path = std::path::absolute(&settings.path).unwrap_or_else(|_| settings.path.clone());
 
     let mut cmd = ffmpeg::command(&tools.ffmpeg);
-    // Everything the filtergraph names is in here, referenced without a path.
-    cmd.current_dir(&assets.dir);
-    cmd.args(["-hide_banner", "-v", "error", "-nostdin", "-y"]);
-    for i in &inputs {
-        cmd.arg("-i").arg(i);
+    cmd.current_dir(&staging);
+    cmd.args(["-hide_banner", "-v", "error", "-y"]);
+    // Input 0 is us.
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba"]);
+    cmd.args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "pipe:0"]);
+    for i in &audio_inputs {
+        cmd.arg("-i").arg(std::path::absolute(i).unwrap_or_else(|_| i.clone()));
     }
-    // A real edit produces a graph far larger than a Windows command line allows, so it goes to
-    // ffmpeg in a file whenever this build supports it.
-    match graph_arg(tools) {
-        GraphArg::SlashFile => {
-            std::fs::write(assets.dir.join("graph.txt"), graph.as_bytes())
-                .context("writing the filtergraph")?;
-            cmd.args(["-/filter_complex", "graph.txt"]);
-        }
-        GraphArg::ScriptFile => {
-            std::fs::write(assets.dir.join("graph.txt"), graph.as_bytes())
-                .context("writing the filtergraph")?;
-            cmd.args(["-filter_complex_script", "graph.txt"]);
-        }
-        GraphArg::Inline => {
-            cmd.arg("-filter_complex").arg(&graph);
+    if has_audio {
+        // Even an audio-only graph can outgrow a Windows command line on a heavily cut edit.
+        match graph_arg(tools) {
+            GraphArg::SlashFile => {
+                std::fs::write(staging.join("graph.txt"), audio_graph.as_bytes())
+                    .context("writing the audio filtergraph")?;
+                cmd.args(["-/filter_complex", "graph.txt"]);
+            }
+            GraphArg::ScriptFile => {
+                std::fs::write(staging.join("graph.txt"), audio_graph.as_bytes())
+                    .context("writing the audio filtergraph")?;
+                cmd.args(["-filter_complex_script", "graph.txt"]);
+            }
+            GraphArg::Inline => {
+                cmd.arg("-filter_complex").arg(&audio_graph);
+            }
         }
     }
-    cmd.args(["-map", "[vout]"]);
+    cmd.args(["-map", "0:v"]);
     if has_audio {
         cmd.args(["-map", "[aout]"]);
     }
@@ -738,55 +646,82 @@ fn run_export(
             cmd.args(["-quality", "balanced", "-rc", "cqp", "-qp_i", &settings.quality.crf().to_string()]);
         }
     }
-    cmd.args(["-pix_fmt", "yuv420p", "-r", &settings.fps.to_string()]);
+    cmd.args(["-pix_fmt", "yuv420p", "-r", &fps.to_string()]);
     // Interleave keyframes for streaming sites and put the index up front.
-    cmd.args(["-g", &(settings.fps * 2).to_string(), "-movflags", "+faststart"]);
+    cmd.args(["-g", &(fps * 2).to_string(), "-movflags", "+faststart"]);
     if has_audio {
         cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", settings.quality.audio_kbps())]);
+        // The mix is as long as the timeline; the picture decides when the file ends.
+        cmd.args(["-shortest"]);
     }
-    cmd.args(["-progress", "pipe:1", "-nostats"]);
-    cmd.arg(&settings.path);
+    cmd.arg(&out_path);
 
     let mut child = cmd
-        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("starting ffmpeg for export")?;
+        .context("starting ffmpeg to encode the render")?;
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let reader = BufReader::new(stdout);
-    let mut frames = 0i64;
-    let mut speed = String::new();
+    // ffmpeg's diagnostics have to be drained on another thread, or a full stderr pipe deadlocks
+    // against us blocking on stdin.
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let errors = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err_pipe.read_to_string(&mut s);
+        s
+    });
+    let mut sink = child.stdin.take().expect("piped stdin");
 
-    for line in reader.lines() {
+    let started = std::time::Instant::now();
+    let mut written = 0i64;
+    let mut render_fail: Option<anyhow::Error> = None;
+    for frame in 0..total_frames {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            std::fs::remove_file(&settings.path).ok();
-            return Ok(());
+            break;
         }
-        let Ok(line) = line else { break };
-        if let Some(v) = line.strip_prefix("frame=") {
-            frames = v.trim().parse().unwrap_or(frames);
-        } else if let Some(v) = line.strip_prefix("speed=") {
-            speed = v.trim().to_string();
-        } else if line.starts_with("progress=") {
-            let pct = if total_frames > 0 {
-                (frames as f32 / total_frames as f32 * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
-            let _ = tx.send(ExportMsg::Progress { pct, frames, speed: speed.clone() });
+        let plan = plan_frame(tl, frame, w, h);
+        frames.retain(&live_clips(&plan));
+        if let Err(e) = renderer.render(&plan, &mut frames) {
+            render_fail = Some(e);
+            break;
+        }
+        let pixels = match renderer.read_rgba() {
+            Ok(p) => p,
+            Err(e) => {
+                render_fail = Some(e);
+                break;
+            }
+        };
+        if sink.write_all(&pixels).is_err() {
+            // ffmpeg went away; its stderr will say why.
+            break;
+        }
+        written += 1;
+        if written % 8 == 0 || written == total_frames {
+            let secs = started.elapsed().as_secs_f32().max(0.001);
+            let _ = tx.send(ExportMsg::Progress {
+                pct: (written as f32 / total_frames as f32 * 100.0).clamp(0.0, 100.0),
+                frames: written,
+                speed: format!("{:.2}x", written as f32 / fps as f32 / secs),
+            });
         }
     }
+    drop(sink);
 
     let status = child.wait().context("waiting for ffmpeg")?;
+    let err = errors.join().unwrap_or_default();
+    std::fs::remove_dir_all(&staging).ok();
+
+    if let Some(e) = render_fail {
+        std::fs::remove_file(&out_path).ok();
+        return Err(e.context("rendering a frame"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        std::fs::remove_file(&out_path).ok();
+        return Ok(());
+    }
     if !status.success() {
-        let mut err = String::new();
-        use std::io::Read;
-        if let Some(mut e) = child.stderr.take() {
-            e.read_to_string(&mut err).ok();
-        }
         let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         let detail = if lines.is_empty() {
             "ffmpeg exited with an error but said nothing".to_string()
@@ -795,6 +730,11 @@ fn run_export(
             lines[lines.len().saturating_sub(6)..].join("  |  ")
         };
         bail!("{detail}");
+    }
+    if written != total_frames {
+        return Err(anyhow!(
+            "rendered {written} of {total_frames} frames before the encoder stopped"
+        ));
     }
     Ok(())
 }
