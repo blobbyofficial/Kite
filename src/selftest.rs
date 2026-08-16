@@ -337,8 +337,20 @@ pub fn export_cli(tools: Arc<Tools>, project_path: &str, out: &str) -> Result<()
         "result: {}x{} {:.2}s video={} audio={}",
         probed.width, probed.height, probed.duration, probed.has_video, probed.has_audio
     );
+    // A file with no sound is only a fault if the timeline had sound to give it. A sequence of
+    // colour cards, or one whose only audio sits on a muted track, is legitimately silent — and
+    // saying which of those happened is the whole point of this command existing.
     if !probed.has_audio {
-        bail!("the exported file has no audio stream");
+        if clips > silent {
+            bail!(
+                "the timeline has {clips} audio clip(s) that should have been heard, but the \
+                 exported file has no sound stream"
+            );
+        }
+        println!(
+            "no sound, and that is expected: {clips} audible clip(s), {silent} at zero volume, \
+             a muted track holding sound: {muted}"
+        );
     }
     Ok(())
 }
