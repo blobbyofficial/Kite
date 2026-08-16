@@ -809,19 +809,29 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
 }
 
 /// Pulls one exact frame out of a rendered file as RGBA.
-fn exported_frame(tools: &Tools, file: &std::path::Path, n: i64, w: u32, h: u32) -> Result<Vec<u8>> {
+///
+/// This seeks to the middle of the frame rather than using `select` and `-vsync`, because
+/// `-vsync` was removed in ffmpeg 8 and the bundled build moves. Seeking is the spelling the rest
+/// of this file already relies on, and it works on every version we ship against.
+fn exported_frame(tools: &Tools, file: &std::path::Path, n: i64, fps: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    // Just before the frame wanted, not inside it: an input seek discards frames whose
+    // timestamp is below the target, so asking for the middle of frame n returns frame n + 1.
+    let at = (n as f64 - 0.5).max(0.0) / fps.max(1) as f64;
     let out = ffmpeg::command(&tools.ffmpeg)
-        .args(["-v", "error", "-i"])
+        .args(["-v", "error", "-ss", &format!("{at:.6}"), "-i"])
         .arg(file)
-        .args(["-vf", &format!("select=eq(n\\,{n})"), "-vsync", "0", "-frames:v", "1"])
-        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .context("reading a frame back out of the render")?;
     let want = (w * h * 4) as usize;
     if out.stdout.len() < want {
-        bail!("frame {n} came back as {} bytes, expected {want}", out.stdout.len());
+        bail!(
+            "frame {n} came back as {} bytes, expected {want}: {}",
+            out.stdout.len(),
+            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("ffmpeg said nothing")
+        );
     }
     Ok(out.stdout[..want].to_vec())
 }
@@ -877,7 +887,7 @@ fn parity_check(
         let plan = crate::render::plan_frame(project.tl(), n, W, H);
         renderer.render(&plan, &mut source)?;
         let preview = renderer.read_rgba()?;
-        let exported = exported_frame(tools, &out, n, W, H)?;
+        let exported = exported_frame(tools, &out, n, 30, W, H)?;
         let d = mean_abs_diff(&preview, &exported);
         if d > 12.0 {
             bail!(
