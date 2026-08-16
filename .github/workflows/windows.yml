@@ -22,15 +22,24 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      # The registry is content-addressed, so an older copy is always safe to reuse.
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-registry-
+
+      # Build output is NOT safe to reuse across a changed dependency graph: a stale target/ from
+      # a different resolution once produced compile errors that had nothing to do with the commit.
+      # Exact key only, so a changed lockfile means a clean build.
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.github/workflows/windows.yml') }}
 
       - name: Run tests
         run: cargo test --release

@@ -22,6 +22,11 @@ egui = "0.33"
 # wgpu directly turns the backends on through feature unification. gles is the fallback for
 # machines whose Vulkan or D3D12 drivers are broken or absent, which is squarely our target.
 wgpu = { version = "27", default-features = false, features = ["vulkan", "dx12", "gles", "metal"] }
+# Note: Cargo.lock matters here. gpu-allocator accepts windows ">=0.53,<=0.58" and will happily
+# unify on the 0.54 that cpal pulls in, while wgpu-hal always wants 0.58 — a legal resolution that
+# fails to compile only once dx12 is built, so it is invisible on Linux. The lock pins both to
+# 0.58. If a future `cargo update` regresses it, the Windows build fails with "multiple different
+# versions of crate `windows`".
 rfd = "0.15"
 cpal = "0.16"
 zune-jpeg = "0.5"
