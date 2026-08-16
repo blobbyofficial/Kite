@@ -2,7 +2,7 @@
 
 A video editor built around one idea: **it should stay fast on a modest laptop.**
 
-**[kite website](https://blobbyofficial.github.io/kite/)** · **[Download](../../releases/latest)**
+**[kite website](https://blobbyofficial.github.io/Kite/)** · **[Download](../../releases/latest)**
 
 This repository holds two things — a working beta of the editor, and the architecture plan it is
 the first step of.
